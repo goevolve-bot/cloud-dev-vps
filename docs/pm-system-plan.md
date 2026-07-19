@@ -13,9 +13,9 @@ the project's own Docker environment.
 
 ## Core ideas
 
-- **Project = repo.** A project points at a clone on the VPS. To be accepted,
-  a repo must satisfy the **project contract** (below) — at minimum it runs
-  under Docker.
+- **Project = repo.** A project points at a clone on the VPS — any repo,
+  including an empty one. To be *verifiable* it must satisfy the **project
+  contract** (below) — at minimum it runs under Docker.
 - **Task = unit of work.** Free-text title + description, evolving as phases run.
 - **Run = one unattended agent invocation in a fresh container.** Every run
   records: phase, provider, model, the full composed prompt, full logs, and a
@@ -31,29 +31,34 @@ the project's own Docker environment.
 
 ## Project contract
 
-Each registered repo must contain:
+The contract is **convention over configuration** — Compose can express nearly
+everything the system needs, so most projects require zero PM-specific files:
 
 1. **`Dockerfile`** — builds the project.
 2. **`compose.yaml`** (or `docker-compose.yml`) — runs the full environment
-   (app + db + whatever it needs).
-3. **`pm.yml`** — small manifest telling the system how to drive it:
+   (app + db + whatever it needs). The main service must define a
+   `healthcheck:`; Verify uses `docker compose up --wait`, so "healthy" is
+   Compose-native.
+3. **Optional one-shot services `test` and `e2e`** — if present, Verify runs
+   them (`docker compose run --rm test`, then `e2e`). A project with an `e2e`
+   service counts as a UI project and must write screenshots/videos to
+   `./pm-artifacts/`.
+4. **`pm.yml`** — *optional* override, only for repos that can't follow the
+   convention (different compose filename, service names, artifacts dir).
 
-```yaml
-compose_file: compose.yaml     # optional, default shown
-service: app                   # main service name
-healthcheck: http://app:3000/  # URL (on the compose network) that must answer
-test: docker compose exec app npm test        # optional
-e2e: docker compose run e2e                   # required if has_ui
-has_ui: true
-artifacts: ./pm-artifacts      # where e2e drops screenshots/videos
-```
+**UI projects must have e2e tests** (Playwright is the recommended standard —
+it natively produces screenshots and videos); the system surfaces the
+artifacts in the task UI, converting videos to GIF/webm previews (ffmpeg) so
+every implementation ends with something you can *see*.
 
-Registration validates the contract and refuses the project (with a clear
-message) if it doesn't comply. **UI projects must have e2e tests** (Playwright
-is the recommended standard — it natively produces screenshots and videos) and
-must write visual artifacts to the declared `artifacts` dir; the system
-surfaces them in the task UI, converting videos to GIF/webm previews (ffmpeg)
-so every implementation ends with something you can *see*.
+**The contract is enforced at verify time, not registration.** Any repo can be
+registered — including an empty one, which is the natural way to start a new
+project. The UI shows a compliance badge, and while a repo is non-compliant,
+every implement prompt automatically includes: *part of your job is to make
+this repo compliant — add the Dockerfile, compose environment with
+healthcheck, and (for UI projects) e2e tests.* The first task on an empty repo
+is thus a bootstrap task; Verify unlocks the moment the contract is met, which
+doubles as that task's definition of done.
 
 ## Container topology
 
@@ -128,7 +133,7 @@ Single Node.js (TypeScript, Fastify) app in the `pm` container:
 ### Data model (SQLite)
 
 - `projects` — id, name, repo_path, default_provider, default_model,
-  contract (parsed pm.yml cache)
+  contract (resolved convention + optional pm.yml overrides, compliance state)
 - `tasks` — id, project_id, title, description, status (`open/done/archived`),
   branch_name
 - `runs` — id, task_id, phase, provider, model, prompt, status
@@ -172,7 +177,8 @@ Prompt templates per phase live in `app/server/prompts/` as plain text.
 React SPA (Vite), responsive single-column-first (desktop and mobile from the
 same layout).
 
-- **Projects** — list, add (pick repo dir; contract validation result shown).
+- **Projects** — list, add (pick repo dir; compliance badge shown, empty repos
+  welcome).
 - **Project view** — task list + filters; new-task form.
 - **Task view** — the heart:
   - editable description (markdown), launch bar (phase × provider × model × Run)
@@ -210,7 +216,7 @@ roles/
 ## Build order
 
 1. **Skeleton** — pm + nginx compose stack, SQLite migrations, React shell,
-   project registration with contract validation, task CRUD.
+   project registration with compliance detection, task CRUD.
 2. **Agent image + claude implement path end-to-end** — workspace prep, run
    container lifecycle, JSONL logs, SSE live tail, outcome capture, branch
    push. (Already covers the "small bugfix" flow.)
@@ -229,7 +235,8 @@ roles/
   environment within a run.
 - Provider credentials via **read-only mounts of host CLI configs** (~/.claude,
   ~/.gemini/antigravity-cli), not API keys.
-- Project contract is the explicit **pm.yml manifest**, not pure convention.
+- Project contract is **convention-first** (compose healthchecks, `test`/`e2e`
+  services, `./pm-artifacts`), with `pm.yml` as an optional override only.
 - nginx basic auth (single user) is the only auth layer; the app trusts the
   proxy. TLS needs `pm_domain` for Let's Encrypt; self-signed until then.
 - Playwright is the recommended e2e standard; any tool works if it writes
