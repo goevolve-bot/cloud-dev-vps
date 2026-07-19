@@ -126,23 +126,29 @@ RAM** (disk only) and restarts in seconds with images/volumes intact:
 - **Manual control**: per-project on/off toggle and an "always on" pin in the
   UI, with an `active / idle / stopped` state badge.
 
-Since the pm container can't run `systemctl` for other OS users, start/stop
-goes through the system's single root-touching interface: **`pm-projectctl`**,
-a ~50-line privileged helper (root systemd service listening on
-`/srv/pm/projectctl.sock`, group `pm`, mounted into the pm container) that
-accepts exactly three validated verbs — `start <project>`, `stop <project>`,
-`status` — and maps them to
-`systemctl --machine=pm-<project>@.host --user start|stop docker`.
-Project names are validated against `/srv/pm/sockets/`; nothing else is
-accepted.
+Since the pm container can't run `systemctl` for other OS users, everything
+privileged goes through the system's single root-touching interface:
+**`pm-projectctl`**, a small privileged helper (root systemd service listening
+on `/srv/pm/projectctl.sock`, group `pm`, mounted into the pm container) with
+a strictly validated verb set:
 
-A host script **`pm-add-project <name> <git-url>`** (Ansible-deployed, run as
-root over SSH — same workflow as `add-repo`) does the privileged setup: create
-the `pm-<name>` user with subuid ranges, install/enable rootless docker with
-the extra group socket, generate the deploy key (prints pubkey, waits like
-`add-repo`), clone the repo into a volume, and drop the socket in
-`/srv/pm/sockets/`. The pm app then discovers the new socket and the project
-appears in the UI — the app itself needs no root and cannot create users.
+- `start <project>` / `stop <project>` / `status` — map to
+  `systemctl --machine=pm-<project>@.host --user start|stop docker`.
+- `create <project> <git-url>` — the full add-repo mechanics, driven from the
+  UI: create the `pm-<name>` user with subuid ranges, set up rootless docker
+  with the extra group socket, generate the deploy key and return the public
+  key (the UI shows it and waits, like `add-repo` did in the terminal), then
+  clone the repo into a volume and scaffold `.pm/` if the repo is empty.
+- `delete <project>` — stop the daemon and remove the user; purging the repo
+  volume and image store is a separate explicit flag. The UI requires typed
+  confirmation and offers "remove but keep data" vs "purge".
+
+Project names are validated (`[a-z0-9-]`, must exist for start/stop/delete);
+git URLs are passed to git only, never a shell. `create`/`delete` widen the
+root-touching surface compared to a manual host script — accepted trade-off
+for having the whole project onboarding flow in the UI; the helper stays
+small enough to audit in one sitting, and a CLI invocation over SSH remains
+possible for the paranoid path.
 
 Rootless Docker can't bind ports <1024 by default; Ansible sets
 `net.ipv4.ip_unprivileged_port_start=80` so nginx (on the pm daemon) can
@@ -164,6 +170,50 @@ manually). Its failures are formatted and fed into the next implement prompt.
 Non-implement agent phases carry a "do not modify files" instruction and the
 workspace is reset afterwards.
 
+## Repo-stored knowledge: tasks, specs, ADRs
+
+The repo is the source of truth for everything durable — tasks, comments, run
+outcomes, specs, and decisions all live in a `.pm/` directory, versioned with
+the project and readable without the pm system:
+
+```
+.pm/
+  tasks/
+    todo/  in-progress/  ready-for-review/  done/  blocked/
+      0012-promo-codes/
+        index.md            # front matter: id, created, branch; body = description
+        comments/0003.md    # one file per comment: front matter (author, ts) + md body
+        runs/0034.md        # per run: front matter (phase, provider, model, status,
+                            #   duration, exit) + outcome as md body
+        attachments/        # user-pasted images, pasted-NN.md text snippets, files
+  specs/                    # living "actual state" docs, one md per area
+  adrs/                     # 0007-title.md, front matter status:
+                            #   accepted | superseded-by: NNN | abandoned
+```
+
+- **Status = folder.** Moving a task is a `git mv`, committed by pm to the
+  **default branch** with messages like `pm: task 12 → in-progress`. Statuses:
+  `todo / in-progress / ready-for-review / done / blocked`. Implementation
+  branches never touch `.pm/` (pm owns it on the default branch), so there are
+  no merge conflicts by construction.
+- **Markdown everywhere, front matter for machine data** — comments and run
+  outcomes are `.md` with YAML front matter: human-readable in any git UI,
+  still parseable. Pure JSON is reserved for nothing; it renders poorly and
+  diffs worse.
+- **Raw execution logs stay out of the repo.** They are huge, noisy JSONL;
+  they live in pm's data dir (with retention) keyed by run id, and the repo's
+  `runs/NNNN.md` carries the durable outcome + a reference. Same for verify
+  videos; small final screenshots may be copied into the run's attachments so
+  the repo keeps visual proof.
+- **Specs and ADRs are agent context and agent output.** Prompts for every
+  phase include relevant specs/ADRs; plan runs may propose ADR drafts and
+  implement runs may update specs — reviewed like any other change on the task
+  branch, then landing in `.pm/` on merge. Abandoned ADRs are kept (status
+  `abandoned`) so the evolution of ideas stays visible.
+- **SQLite demotes to cache + runtime state**: an index of `.pm/` for fast
+  lists/search (rebuilt by fetch + parse on activation and after each pm
+  write) plus live-only data — queue, running containers, SSE streams.
+
 ## Architecture
 
 Single Node.js (TypeScript, Fastify) app in the `pm` container:
@@ -180,15 +230,17 @@ Single Node.js (TypeScript, Fastify) app in the `pm` container:
   per-run timeout (default 30 min), cancel = stop container. App restart marks
   in-flight runs `interrupted`.
 
-### Data model (SQLite)
+### Data model (SQLite — cache + runtime only; `.pm/` in the repo is truth)
 
 - `projects` — id, name, socket_path, git_url, default_provider, default_model,
-  contract (resolved convention + optional pm.yml overrides, compliance state)
-- `tasks` — id, project_id, title, description, status (`open/done/archived`),
-  branch_name
-- `runs` — id, task_id, phase, provider, model, prompt, status
+  contract (resolved convention + optional pm.yml overrides, compliance state),
+  lifecycle state, always_on
+- `tasks`, `comments`, `task_runs` — parsed cache of `.pm/` for fast list,
+  search, and rendering; rebuilt from the repo at any time
+- `runs` (runtime) — id, task_id, phase, provider, model, prompt, status
   (`queued/running/succeeded/failed/cancelled/interrupted`), exit_code,
-  started/finished, log_path, outcome_md, outcome_json, artifacts_dir
+  started/finished, log_path (JSONL in pm data dir), artifacts_dir; on
+  completion pm writes the durable outcome to `.pm/tasks/…/runs/NNNN.md`
 - `questions` — id, task_id, run_id, text, answer, answered_at
 
 ### Git flow (host-agnostic)
@@ -227,20 +279,32 @@ Prompt templates per phase live in `app/server/prompts/` as plain text.
 
 ## Web UI
 
-React SPA (Vite), responsive single-column-first (desktop and mobile from the
-same layout).
+React SPA (Vite), compact by design — tight paddings, dense lists, space used
+for content. Wireframe: `docs/pm-ui-wireframe.html` (v1, agreed layout).
 
-- **Projects** — list; new projects appear automatically once
-  `pm-add-project` has been run on the host (compliance badge shown, empty
-  repos welcome); per-project `active / idle / stopped` badge, on/off toggle,
-  "always on" pin.
-- **Project view** — task list + filters; new-task form.
-- **Task view** — the heart:
-  - editable description (markdown), launch bar (phase × provider × model × Run)
-  - run timeline, each run expandable: outcome markdown, live log tail (SSE)
-  - interview answer form; plan viewer; verify results with an **artifacts
-    gallery** (screenshots inline, video/GIF playback); review findings;
-    branch name + diffstat
+- **Header bar** — project selector dropdown (last entry "+ add project…" →
+  two-step modal driving `pm-projectctl create`, showing the deploy pubkey and
+  waiting for confirmation); tabs **Tasks / Specs / ADRs**; search over the
+  cached index of the current project; daemon state badge
+  (`active / idle / stopped`, click to toggle, "always on" pin); logout.
+- **Left sidebar (Tasks)** — task list grouped by status folder
+  (todo / in progress / ready for review / done / blocked), collapsible
+  groups, live dot on tasks with a running agent, "+ new task".
+- **Main area (task)** — title + status select + branch chip; launch bar
+  (phase × provider × model × Run, plus quick-launch buttons per phase);
+  markdown description with clipboard handling — pasted image → attachment,
+  large text paste → `pasted-NN.md` attachment (as in Claude chats), explicit
+  attach button — all stored under the task folder in the repo; **timeline**
+  mixing status changes, comments (composer pinned at bottom), and runs —
+  running ones tail logs live via SSE with a stop button, finished ones render
+  the outcome md, verify entries show the **artifacts gallery** (screenshot
+  thumbnails, GIF/video playback, lightbox); interview runs render the answer
+  form inline.
+- **Specs / ADRs tabs** — file list left (ADRs with status chips; abandoned
+  kept and struck through), rendered markdown right, per-file git history
+  link.
+- **Mobile** — list, task, and run/log become separate screens; sidebar
+  becomes a drawer; launch bar collapses.
 
 ## Repo layout (this repo)
 
@@ -252,9 +316,9 @@ app/
   compose.yaml     pm + nginx stack
   nginx/           nginx conf template, htpasswd handling
   package.json     pnpm workspace root
-  scripts/         pm-add-project, pm-projectctl (host-side, Ansible-deployed)
+  scripts/         pm-projectctl (privileged host helper, Ansible-deployed)
 roles/
-  pm/              deploy the compose stack + pm-add-project (see below)
+  pm/              deploy the compose stack + pm-projectctl (see below)
 ```
 
 ## Deployment (Ansible)
@@ -267,25 +331,28 @@ roles/
   set sysctl `net.ipv4.ip_unprivileged_port_start=80`; render nginx conf +
   htpasswd from vaulted `pm_auth_password`; TLS certs in a volume — certbot
   sidecar when `pm_domain` is set, self-signed fallback otherwise; install
-  `pm-add-project` to `/usr/local/sbin`, install the `pm-projectctl` helper
-  service, and sync provider creds into `/srv/pm/creds/`.
+  the `pm-projectctl` helper service and sync provider creds into
+  `/srv/pm/creds/`.
 - **`roles/nftables`**: template gains 80/443 accept rules.
 - No host Node/nginx dependencies — the host needs only rootless Docker
   tooling, which the playbook already provides.
 
 ## Build order
 
-1. **Skeleton** — pm + nginx compose stack, `pm-add-project` script, socket
-   discovery, compliance detection, task CRUD, SQLite migrations, React shell.
+1. **Skeleton** — pm + nginx compose stack, `pm-projectctl` (create/start/
+   stop/status/delete), add-project modal flow, `.pm/` scaffold + parser +
+   SQLite cache, task CRUD writing to the repo, React shell per the wireframe.
 2. **Agent image + claude implement path end-to-end** — workspace volume prep,
    run container lifecycle on the project daemon, JSONL logs, SSE live tail,
-   outcome capture, branch push. (Already covers the "small bugfix" flow.)
+   outcome md written to `.pm/`, branch push. (Already covers the "small
+   bugfix" flow.)
 3. **Verify stage** — fresh checkout, compose up --build, healthcheck, test,
    e2e, artifacts gallery (screenshots/video → GIF via ffmpeg).
 4. **Interview / refine / plan / review** — prompt templates, question form,
-   description versioning, findings → next iteration.
-5. **Project lifecycle** — `pm-projectctl` helper, auto-activate on queued
-   runs, idle-timeout deactivation, UI toggle/pin/badges.
+   description versioning, findings → next iteration; specs/ADR tabs +
+   rendering.
+5. **Project lifecycle** — auto-activate on queued runs, idle-timeout
+   deactivation, UI toggle/pin/badges.
 6. **Antigravity adapter.**
 7. **Ansible role** — `roles/pm`, firewall change; deploy for real.
 
@@ -303,3 +370,7 @@ roles/
   proxy. TLS needs `pm_domain` for Let's Encrypt; self-signed until then.
 - Playwright is the recommended e2e standard; any tool works if it writes
   screenshots/videos to the declared artifacts dir.
+- `.pm/` writes land on the **default branch** as direct pm commits (audit
+  trail is the git log); implementation branches never touch `.pm/`.
+- Comments and run outcomes are **markdown with YAML front matter**, not JSON;
+  raw JSONL logs and videos stay in pm's data dir with retention.
