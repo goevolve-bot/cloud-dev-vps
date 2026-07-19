@@ -60,44 +60,68 @@ healthcheck, and (for UI projects) e2e tests.* The first task on an empty repo
 is thus a bootstrap task; Verify unlocks the moment the contract is met, which
 doubles as that task's definition of done.
 
-## Container topology
+## Container topology — one rootless daemon per project
 
-The VPS already provisions **rootless Docker** for `{{ dev_user }}`
-(`roles/dev_tools/tasks/docker_rootless.yml`). Everything below runs on that
-rootless daemon — a container that gets the socket can act as `dev_user`, not
-root. That's still real power (acknowledged trade-off), but strictly better
-than the root daemon or running the system on the host.
+With rootless Docker, **the socket is the security boundary**: anyone holding a
+daemon's socket can act as that daemon's OS user. So project isolation means
+**one OS user + one rootless dockerd per project**, plus one for the pm system
+itself. An agent working on project X holds only X's socket and can therefore
+only touch X's containers, volumes, and files — never another project, never
+the pm database.
 
 ```
-rootless dockerd (dev_user)
-├─ pm stack (compose):
-│    nginx  — TLS + basic auth, publishes 80/443
-│    pm     — Fastify app; mounts:
-│              /run/user/<uid>/docker.sock   (controls sibling containers)
-│              ~/.pm        (db, logs, workspaces, artifacts — same path as host)
-│              ~/projects   (registered repos, read-only)
-│              ~/.ssh       (deploy keys — pm pushes branches, agents never see keys)
-├─ agent run containers (one per run, sibling, auto-removed):
-│    image: pm-agent (generic: claude, agy, git, node, uv, docker CLI, playwright deps)
-│    mounts: task workspace (rw), rootless socket, ~/.claude + ~/.gemini/antigravity-cli (ro)
-│    env: no SSH keys, no pm credentials
-└─ per-task verification environments:
-     the project's own compose stack, unique project name pm-t<task>-r<run>,
-     no host-published ports (reached via its compose network)
+host
+├─ user pm            → rootless dockerd A
+│    pm stack (compose):
+│      nginx — TLS + basic auth, publishes 80/443
+│      pm   — Fastify app; mounts /srv/pm/sockets/ (all project sockets)
+│             and its own data dir (db, logs, extracted artifacts)
+├─ user pm-<proj1>    → rootless dockerd B   (socket /srv/pm/sockets/proj1.sock)
+│    ├─ agent run containers (one per run, auto-removed):
+│    │    image pm-agent; mounts: task workspace volume (rw),
+│    │    proj1's own socket, provider creds (ro). No other project visible.
+│    ├─ per-task verification environments (project compose stack,
+│    │    unique name pm-t<task>-r<run>, no host-published ports)
+│    └─ utility containers (git checkout / push / docker cp jobs run by pm)
+└─ user pm-<proj2>    → rootless dockerd C   (…same shape…)
 ```
 
-Because pm is itself a container using the host's socket, **all bind mounts it
-asks Docker for resolve on the host** — so `~/.pm` and `~/projects` are mounted
-into pm at their host paths, keeping paths identical inside and out (the
-classic sibling-container mapping problem, solved by convention).
+Key consequences of this design:
 
-Agent containers get the socket so an implement run can compose-up the project,
-run tests/e2e, see failures, and fix them **within a single run** — the
-autonomous loop. Provider credentials come from the host CLI configs mounted
-read-only (reuses existing logins/subscriptions; no separate API billing).
+- **pm's only interface to a project is that project's socket.** Each rootless
+  dockerd listens on an extra socket at `/srv/pm/sockets/<project>.sock`
+  (group `pm`, mode 0660). pm never touches project users' homes: run logs
+  stream via `docker logs`/attach, task workspaces and verify checkouts are
+  **named volumes** on the project daemon (which also kills the
+  sibling-container path-mapping problem), and artifacts are pulled out with
+  `docker cp` into pm's data dir for serving.
+- **Agents keep the autonomous loop, scoped to their project**: an implement
+  run can compose-up the project, run tests/e2e, see failures, and fix them
+  within a single run — on its own daemon only.
+- **Deploy keys are per-project and live with the project user** (the
+  `add-repo` model). Pushes run in a utility container on the project daemon.
+  Worst case an agent extracts *its own project's* deploy key — blast radius
+  stays inside the project it already controls.
+- **Provider credentials are the one shared thing** (your Claude/Antigravity
+  logins), mounted read-only from `/srv/pm/creds/` (group `pm-projects`). Any
+  agent can use them — inherent to sharing a subscription. If concurrent OAuth
+  token refresh across daemons proves flaky, fall back to per-provider API
+  keys (open item).
+- **Cost**: each rootless dockerd has its own memory footprint and image
+  store (the pm-agent image is duplicated per project). Fine for a handful of
+  projects on a VPS; it's the price of the boundary.
+
+A host script **`pm-add-project <name> <git-url>`** (Ansible-deployed, run as
+root over SSH — same workflow as `add-repo`) does the privileged setup: create
+the `pm-<name>` user with subuid ranges, install/enable rootless docker with
+the extra group socket, generate the deploy key (prints pubkey, waits like
+`add-repo`), clone the repo into a volume, and drop the socket in
+`/srv/pm/sockets/`. The pm app then discovers the new socket and the project
+appears in the UI — the app itself needs no root and cannot create users.
 
 Rootless Docker can't bind ports <1024 by default; Ansible sets
-`net.ipv4.ip_unprivileged_port_start=80` so nginx can publish 80/443.
+`net.ipv4.ip_unprivileged_port_start=80` so nginx (on the pm daemon) can
+publish 80/443.
 
 ## Phases and their outcomes
 
@@ -124,15 +148,16 @@ Single Node.js (TypeScript, Fastify) app in the `pm` container:
 - SQLite (better-sqlite3) at `~/.pm/pm.db`; run logs as JSONL at
   `~/.pm/logs/<run>.jsonl`.
 - Runner drives Docker via the docker CLI + compose plugin (installed in the
-  pm image) against the mounted socket — same commands agents and humans use,
-  easy to debug.
+  pm image), selecting the target project with
+  `DOCKER_HOST=unix:///srv/pm/sockets/<project>.sock` — same commands agents
+  and humans use, easy to debug.
 - In-process queue: serial per task, global concurrency limit (default 2),
   per-run timeout (default 30 min), cancel = stop container. App restart marks
   in-flight runs `interrupted`.
 
 ### Data model (SQLite)
 
-- `projects` — id, name, repo_path, default_provider, default_model,
+- `projects` — id, name, socket_path, git_url, default_provider, default_model,
   contract (resolved convention + optional pm.yml overrides, compliance state)
 - `tasks` — id, project_id, title, description, status (`open/done/archived`),
   branch_name
@@ -143,17 +168,20 @@ Single Node.js (TypeScript, Fastify) app in the `pm` container:
 
 ### Git flow (host-agnostic)
 
-1. First run on a task: workspace = `git clone <project repo path>
-   ~/.pm/workspaces/<task-id>` (local clone, cheap), then
-   `git remote set-url origin <real origin from project repo>`;
-   branch `pm/task-<id>-<slug>` from the default branch. Later runs reuse it.
-2. Agent commits in the workspace (it has no push access).
-3. After a successful implement run, **pm pushes the branch** using the
-   mounted `~/.ssh` (deploy keys from `add-repo`, or whatever the remote
-   needs). Works for GitHub, GitLab, Gitea, bare SSH remotes — no forge API,
+All git operations happen in utility containers on the project's daemon,
+against named volumes — pm never touches a filesystem path directly.
+
+1. First run on a task: pm runs a git utility container on the project daemon
+   that clones from the project's mirror volume (kept fresh by fetches),
+   creates branch `pm/task-<id>-<slug>` from the default branch in a new
+   workspace volume `pm-task-<id>`. Later runs reuse the volume.
+2. Agent commits in the workspace volume (its container has no deploy key).
+3. After a successful implement run, pm launches a push container (same
+   daemon, deploy key mounted from the project user's home) to push the
+   branch. Works for GitHub, GitLab, Gitea, bare SSH remotes — no forge API,
    no gh CLI.
-4. Verify/review use a **separate fresh checkout** of the pushed branch so
-   they test what was actually delivered, not the agent's dirty workspace.
+4. Verify/review check the pushed branch out into a **separate fresh volume**
+   so they test what was actually delivered, not the agent's dirty workspace.
 
 ### Provider adapters
 
@@ -177,8 +205,9 @@ Prompt templates per phase live in `app/server/prompts/` as plain text.
 React SPA (Vite), responsive single-column-first (desktop and mobile from the
 same layout).
 
-- **Projects** — list, add (pick repo dir; compliance badge shown, empty repos
-  welcome).
+- **Projects** — list; new projects appear automatically once
+  `pm-add-project` has been run on the host (compliance badge shown, empty
+  repos welcome).
 - **Project view** — task list + filters; new-task form.
 - **Task view** — the heart:
   - editable description (markdown), launch bar (phase × provider × model × Run)
@@ -197,29 +226,34 @@ app/
   compose.yaml     pm + nginx stack
   nginx/           nginx conf template, htpasswd handling
   package.json     pnpm workspace root
+  scripts/         pm-add-project (host script, Ansible-deployed)
 roles/
-  pm/              deploy the compose stack (see below)
+  pm/              deploy the compose stack + pm-add-project (see below)
 ```
 
 ## Deployment (Ansible)
 
-- **`roles/pm`**: sync `app/` to the VPS; build `pm`, `pm-agent` images and
-  bring up the compose stack **as `{{ dev_user }}` on the rootless daemon**
-  (systemd user unit wrapping `docker compose up -d`, linger already enabled);
+- **`roles/pm`**: create the `pm` user with its own rootless dockerd (reusing
+  the tasks from `docker_rootless.yml`, generalized); create the `pm` and
+  `pm-projects` groups and `/srv/pm/{sockets,creds}`; sync `app/` to the VPS;
+  build `pm` + `pm-agent` images and bring up the compose stack as the `pm`
+  user (systemd user unit wrapping `docker compose up -d`, linger enabled);
   set sysctl `net.ipv4.ip_unprivileged_port_start=80`; render nginx conf +
   htpasswd from vaulted `pm_auth_password`; TLS certs in a volume — certbot
-  sidecar when `pm_domain` is set, self-signed fallback otherwise.
+  sidecar when `pm_domain` is set, self-signed fallback otherwise; install
+  `pm-add-project` to `/usr/local/sbin` and sync provider creds into
+  `/srv/pm/creds/`.
 - **`roles/nftables`**: template gains 80/443 accept rules.
-- No host Node/nginx dependencies — the host only needs rootless Docker, which
-  the playbook already provides.
+- No host Node/nginx dependencies — the host needs only rootless Docker
+  tooling, which the playbook already provides.
 
 ## Build order
 
-1. **Skeleton** — pm + nginx compose stack, SQLite migrations, React shell,
-   project registration with compliance detection, task CRUD.
-2. **Agent image + claude implement path end-to-end** — workspace prep, run
-   container lifecycle, JSONL logs, SSE live tail, outcome capture, branch
-   push. (Already covers the "small bugfix" flow.)
+1. **Skeleton** — pm + nginx compose stack, `pm-add-project` script, socket
+   discovery, compliance detection, task CRUD, SQLite migrations, React shell.
+2. **Agent image + claude implement path end-to-end** — workspace volume prep,
+   run container lifecycle on the project daemon, JSONL logs, SSE live tail,
+   outcome capture, branch push. (Already covers the "small bugfix" flow.)
 3. **Verify stage** — fresh checkout, compose up --build, healthcheck, test,
    e2e, artifacts gallery (screenshots/video → GIF via ffmpeg).
 4. **Interview / refine / plan / review** — prompt templates, question form,
@@ -231,8 +265,8 @@ roles/
 
 - Agent runs use one **generic agent image**; the project's own containers are
   used for running/verifying the app, not for hosting the agent.
-- Agent containers **get the rootless socket** so they can iterate on the real
-  environment within a run.
+- Agent containers **get their own project's rootless socket only** so they can
+  iterate on the real environment within a run without reaching other projects.
 - Provider credentials via **read-only mounts of host CLI configs** (~/.claude,
   ~/.gemini/antigravity-cli), not API keys.
 - Project contract is **convention-first** (compose healthchecks, `test`/`e2e`
