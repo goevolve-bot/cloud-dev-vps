@@ -107,9 +107,34 @@ Key consequences of this design:
   agent can use them — inherent to sharing a subscription. If concurrent OAuth
   token refresh across daemons proves flaky, fall back to per-provider API
   keys (open item).
-- **Cost**: each rootless dockerd has its own memory footprint and image
-  store (the pm-agent image is duplicated per project). Fine for a handful of
-  projects on a VPS; it's the price of the boundary.
+- **Cost**: an active rootless daemon (rootlesskit + dockerd + containerd) is
+  roughly 100–180 MB RSS idle; disk is the bigger cost since each daemon has
+  its own image store (pm-agent ≈ 1.5–2 GB, duplicated per project, plus the
+  project's own images/volumes). Disk is the price of the boundary; RAM is
+  reclaimed by the lifecycle below.
+
+### Project lifecycle — daemons on demand
+
+Project daemons are systemd user services, so a stopped project costs **zero
+RAM** (disk only) and restarts in seconds with images/volumes intact:
+
+- **Auto-activate**: queueing any run on a stopped project starts its daemon;
+  pm waits for the socket, then proceeds (UI shows "starting…").
+- **Auto-deactivate**: after the last run finishes and an idle timeout passes
+  (default 15 min, configurable per project), pm composes down leftover
+  verification environments and stops the daemon.
+- **Manual control**: per-project on/off toggle and an "always on" pin in the
+  UI, with an `active / idle / stopped` state badge.
+
+Since the pm container can't run `systemctl` for other OS users, start/stop
+goes through the system's single root-touching interface: **`pm-projectctl`**,
+a ~50-line privileged helper (root systemd service listening on
+`/srv/pm/projectctl.sock`, group `pm`, mounted into the pm container) that
+accepts exactly three validated verbs — `start <project>`, `stop <project>`,
+`status` — and maps them to
+`systemctl --machine=pm-<project>@.host --user start|stop docker`.
+Project names are validated against `/srv/pm/sockets/`; nothing else is
+accepted.
 
 A host script **`pm-add-project <name> <git-url>`** (Ansible-deployed, run as
 root over SSH — same workflow as `add-repo`) does the privileged setup: create
@@ -207,7 +232,8 @@ same layout).
 
 - **Projects** — list; new projects appear automatically once
   `pm-add-project` has been run on the host (compliance badge shown, empty
-  repos welcome).
+  repos welcome); per-project `active / idle / stopped` badge, on/off toggle,
+  "always on" pin.
 - **Project view** — task list + filters; new-task form.
 - **Task view** — the heart:
   - editable description (markdown), launch bar (phase × provider × model × Run)
@@ -226,7 +252,7 @@ app/
   compose.yaml     pm + nginx stack
   nginx/           nginx conf template, htpasswd handling
   package.json     pnpm workspace root
-  scripts/         pm-add-project (host script, Ansible-deployed)
+  scripts/         pm-add-project, pm-projectctl (host-side, Ansible-deployed)
 roles/
   pm/              deploy the compose stack + pm-add-project (see below)
 ```
@@ -241,8 +267,8 @@ roles/
   set sysctl `net.ipv4.ip_unprivileged_port_start=80`; render nginx conf +
   htpasswd from vaulted `pm_auth_password`; TLS certs in a volume — certbot
   sidecar when `pm_domain` is set, self-signed fallback otherwise; install
-  `pm-add-project` to `/usr/local/sbin` and sync provider creds into
-  `/srv/pm/creds/`.
+  `pm-add-project` to `/usr/local/sbin`, install the `pm-projectctl` helper
+  service, and sync provider creds into `/srv/pm/creds/`.
 - **`roles/nftables`**: template gains 80/443 accept rules.
 - No host Node/nginx dependencies — the host needs only rootless Docker
   tooling, which the playbook already provides.
@@ -258,8 +284,10 @@ roles/
    e2e, artifacts gallery (screenshots/video → GIF via ffmpeg).
 4. **Interview / refine / plan / review** — prompt templates, question form,
    description versioning, findings → next iteration.
-5. **Antigravity adapter.**
-6. **Ansible role** — `roles/pm`, firewall change; deploy for real.
+5. **Project lifecycle** — `pm-projectctl` helper, auto-activate on queued
+   runs, idle-timeout deactivation, UI toggle/pin/badges.
+6. **Antigravity adapter.**
+7. **Ansible role** — `roles/pm`, firewall change; deploy for real.
 
 ## Defaults chosen (flag if you disagree)
 
