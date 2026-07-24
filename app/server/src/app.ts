@@ -1,6 +1,8 @@
 import type Database from "better-sqlite3";
 import Fastify, { type FastifyInstance } from "fastify";
 import { existsSync, readFileSync } from "node:fs";
+import { readdir } from "node:fs/promises";
+import { join } from "node:path";
 import {
   addComment,
   createTask,
@@ -17,7 +19,7 @@ import {
 } from "@pm/core";
 import { reindexTask } from "./indexer/index.js";
 import type { RunnerRegistry } from "./runners/registry.js";
-import { QueueManager, sseEmitter, activeRunnerRunIds, callProjectctl } from "./queue.js";
+import { QueueManager, sseEmitter, activeRunnerRunIds } from "./queue.js";
 
 export interface AppContext {
   readonly db: Database.Database;
@@ -31,6 +33,7 @@ interface ProjectRow {
   readonly repo_dir: string | null;
   readonly default_provider: string | null;
   readonly default_model: string | null;
+  readonly contract_json: string | null;
   readonly lifecycle: string;
   readonly always_on: number;
   readonly created_at: string;
@@ -49,6 +52,14 @@ interface TaskRow {
 }
 
 function serializeProject(row: ProjectRow, runnerState: string) {
+  let contract = null;
+  if (row.contract_json) {
+    try {
+      contract = JSON.parse(row.contract_json);
+    } catch {
+      // ignore
+    }
+  }
   return {
     id: row.id,
     name: row.name,
@@ -56,6 +67,7 @@ function serializeProject(row: ProjectRow, runnerState: string) {
     repoDir: row.repo_dir,
     defaultProvider: row.default_provider,
     defaultModel: row.default_model,
+    contract,
     lifecycle: row.lifecycle,
     alwaysOn: Boolean(row.always_on),
     runnerState,
@@ -446,7 +458,7 @@ export function buildApp(ctx: AppContext): FastifyInstance {
         for (const line of lines) {
           reply.raw.write(`data: ${JSON.stringify({ type: "log", runId, line })}\n\n`);
         }
-      } catch (err) {
+      } catch {
         // ignore
       }
     }
@@ -467,6 +479,49 @@ export function buildApp(ctx: AppContext): FastifyInstance {
       sseEmitter.off(`run-${runId}`, onLine);
       sseEmitter.off(`run-${runId}-end`, onEnd);
     });
+  });
+
+  app.get("/api/projects/:name/tasks/:taskNum/runs/:runNum/artifacts", async (request, reply) => {
+    const { name, runNum } = request.params as {
+      name: string;
+      runNum: string;
+    };
+    const project = getProjectRow(name);
+    if (!project) return reply.code(404).send({ error: "project_not_found" });
+    if (!project.repo_dir) return reply.code(409).send({ error: "project_has_no_repo" });
+
+    const repoPmDir = pmDirFor(project.repo_dir);
+    const runArtifactsDir = join(repoPmDir, "verify-artifacts", runNum);
+
+    try {
+      const files = await readdir(runArtifactsDir);
+      return { artifacts: files };
+    } catch {
+      return { artifacts: [] };
+    }
+  });
+
+  app.get("/api/projects/:name/tasks/:taskNum/runs/:runNum/artifacts/:filename", async (request, reply) => {
+    const { name, runNum, filename } = request.params as {
+      name: string;
+      runNum: string;
+      filename: string;
+    };
+    if (!isSafeFilename(filename)) return reply.code(400).send({ error: "invalid_filename" });
+    
+    const project = getProjectRow(name);
+    if (!project) return reply.code(404).send({ error: "project_not_found" });
+    if (!project.repo_dir) return reply.code(409).send({ error: "project_has_no_repo" });
+
+    const repoPmDir = pmDirFor(project.repo_dir);
+    const filePath = join(repoPmDir, "verify-artifacts", runNum, filename);
+
+    try {
+      const data = readFileSync(filePath);
+      return reply.type(mimeFor(filename)).send(data);
+    } catch {
+      return reply.code(404).send({ error: "artifact_file_not_found" });
+    }
   });
 
   return app;

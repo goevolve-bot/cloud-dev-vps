@@ -7,4 +7,5 @@ export * from "./specs.js";
 export * from "./adrs.js";
 export * from "./runner-protocol.js";
 export * from "./adapters/index.js";
+export * from "./contract.js";
 

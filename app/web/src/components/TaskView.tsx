@@ -76,6 +76,136 @@ function LiveLogs({ runId }: LiveLogsProps) {
   );
 }
 
+interface ArtifactsGalleryProps {
+  readonly project: string;
+  readonly taskId: number;
+  readonly runNum: number;
+}
+
+function ArtifactsGallery({ project, taskId, runNum }: ArtifactsGalleryProps) {
+  const [artifacts, setArtifacts] = useState<string[]>([]);
+  const [lightbox, setLightbox] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    async function load() {
+      try {
+        const res = await fetch(`/api/projects/${project}/tasks/${taskId}/runs/${runNum}/artifacts`);
+        if (res.ok) {
+          const body = await res.json() as { artifacts: string[] };
+          if (active) setArtifacts(body.artifacts || []);
+        }
+      } catch (err) {
+        console.error("failed to load artifacts", err);
+      }
+    }
+    void load();
+    return () => {
+      active = false;
+    };
+  }, [project, taskId, runNum]);
+
+  if (artifacts.length === 0) return null;
+
+  return (
+    <div className="artifacts-gallery-section" style={{ marginTop: 12 }}>
+      <div className="muted small-label" style={{ marginBottom: 6 }}>VERIFICATION ARTIFACTS</div>
+      <div className="artifacts-grid" style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+        {artifacts.map((file) => {
+          const url = `/api/projects/${project}/tasks/${taskId}/runs/${runNum}/artifacts/${encodeURIComponent(file)}`;
+          const ext = file.split(".").pop()?.toLowerCase() || "";
+          
+          if (ext === "png" || ext === "jpg" || ext === "jpeg" || ext === "gif") {
+            return (
+              <div
+                key={file}
+                className="artifact-item"
+                style={{ cursor: "pointer", border: "1px solid var(--border)", borderRadius: 4, overflow: "hidden", width: 120, height: 90 }}
+                onClick={() => setLightbox(url)}
+              >
+                <img
+                  src={url}
+                  alt={file}
+                  style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                  loading="lazy"
+                />
+              </div>
+            );
+          } else if (ext === "webm" || ext === "mp4") {
+            return (
+              <div
+                key={file}
+                className="artifact-item"
+                style={{ border: "1px solid var(--border)", borderRadius: 4, overflow: "hidden", width: 160, height: 90 }}
+              >
+                <video
+                  src={url}
+                  controls
+                  muted
+                  playsInline
+                  style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                />
+              </div>
+            );
+          } else {
+            return (
+              <a
+                key={file}
+                href={url}
+                target="_blank"
+                rel="noreferrer"
+                className="chip"
+                style={{ display: "inline-flex", alignItems: "center", textDecoration: "none" }}
+              >
+                🗎 {file}
+              </a>
+            );
+          }
+        })}
+      </div>
+
+      {lightbox && (
+        <div
+          className="lightbox-overlay"
+          style={{
+            position: "fixed",
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            backgroundColor: "rgba(0,0,0,0.8)",
+            display: "flex",
+            justifyContent: "center",
+            alignItems: "center",
+            zIndex: 9999,
+          }}
+          onClick={() => setLightbox(null)}
+        >
+          <div style={{ position: "relative", maxWidth: "90%", maxHeight: "90%" }} onClick={(e) => e.stopPropagation()}>
+            <img src={lightbox} alt="Lightbox View" style={{ maxWidth: "100%", maxHeight: "100%", display: "block" }} />
+            <button
+              type="button"
+              style={{
+                position: "absolute",
+                top: -30,
+                right: 0,
+                background: "none",
+                border: "none",
+                color: "white",
+                fontSize: 20,
+                cursor: "pointer",
+              }}
+              onClick={() => setLightbox(null)}
+            >
+              ✕ Close
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export interface TaskViewProps {
   readonly task: Task;
   readonly project: string;
@@ -421,6 +551,9 @@ export function TaskView({ task, project, onSave, onStatusChange }: TaskViewProp
                     {r.tokens_out || 0}
                   </div>
                   <Markdown text={r.outcome} />
+                  {r.phase === "verify" && (
+                    <ArtifactsGallery project={project} taskId={task.id} runNum={r.run_num} />
+                  )}
                 </div>
               </div>
             );

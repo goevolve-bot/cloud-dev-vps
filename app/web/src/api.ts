@@ -1,3 +1,13 @@
+export interface ContractState {
+  readonly composeFileExists: boolean;
+  readonly mainServiceExists: boolean;
+  readonly mainServiceHasHealthcheck: boolean;
+  readonly hasTest: boolean;
+  readonly hasE2E: boolean;
+  readonly hasUI: boolean;
+  readonly isCompliant: boolean;
+}
+
 export interface Project {
   readonly id: number;
   readonly name: string;
@@ -5,6 +15,7 @@ export interface Project {
   readonly repoDir: string | null;
   readonly defaultProvider: string | null;
   readonly defaultModel: string | null;
+  readonly contract: ContractState | null;
   readonly lifecycle: string;
   readonly alwaysOn: boolean;
   readonly runnerState: "connected" | "disconnected";

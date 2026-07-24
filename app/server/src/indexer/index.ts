@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import { findTask, listComments, listRuns, listTasks, pmDirFor, type TaskRecord } from "@pm/core";
+import { findTask, listComments, listRuns, listTasks, pmDirFor, type TaskRecord, detectContract } from "@pm/core";
 import {
   deleteProjectCache,
   deleteTaskCache,
@@ -45,6 +45,17 @@ export async function rebuildIndex(
   project: IndexedProject,
   now: () => string = defaultNow,
 ): Promise<IndexStats> {
+  const nameRow = db.prepare("SELECT name FROM projects WHERE id = ?").get(project.id) as { name: string } | undefined;
+  const projectName = nameRow?.name || "";
+  const contract = await detectContract(project.repoDir, projectName);
+  
+  db.transaction(() => {
+    db.prepare("UPDATE projects SET contract_json = ? WHERE id = ?").run(
+      JSON.stringify(contract),
+      project.id,
+    );
+  })();
+
   const pmDir = pmDirFor(project.repoDir);
   const tasks = await listTasks(pmDir);
   db.transaction(() => deleteProjectCache(db, project.id))();
@@ -71,6 +82,17 @@ export async function reindexTask(
   taskId: number,
   now: () => string = defaultNow,
 ): Promise<boolean> {
+  const nameRow = db.prepare("SELECT name FROM projects WHERE id = ?").get(project.id) as { name: string } | undefined;
+  const projectName = nameRow?.name || "";
+  const contract = await detectContract(project.repoDir, projectName);
+
+  db.transaction(() => {
+    db.prepare("UPDATE projects SET contract_json = ? WHERE id = ?").run(
+      JSON.stringify(contract),
+      project.id,
+    );
+  })();
+
   const pmDir = pmDirFor(project.repoDir);
   const task = await findTask(pmDir, taskId);
   if (!task) {

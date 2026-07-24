@@ -11,7 +11,8 @@
     "test": "tsc -p tsconfig.json && node --test 'dist/**/*.test.js'"
   },
   "dependencies": {
-    "@pm/core": "workspace:*"
+    "@pm/core": "workspace:*",
+    "yaml": "^2.7.0"
   },
   "devDependencies": {
     "@types/node": "catalog:",

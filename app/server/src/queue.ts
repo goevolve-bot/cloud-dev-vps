@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { appendFile, mkdir } from "node:fs/promises";
+import { appendFile, mkdir, readdir, copyFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createConnection } from "node:net";
 import type Database from "better-sqlite3";
@@ -155,13 +155,40 @@ export class QueueManager {
         .prepare("UPDATE runs SET status = 'running', started_at = ? WHERE id = ?")
         .run(new Date().toISOString(), run.id);
 
+      let prompt = run.prompt || "";
+      if (run.phase === "implement") {
+        const lastFailedVerify = this.db
+          .prepare(
+            "SELECT outcome FROM task_runs WHERE project_id = ? AND task_num = ? AND phase = 'verify' AND status = 'failed' ORDER BY run_num DESC LIMIT 1"
+          )
+          .get(run.project_id, run.task_num) as { outcome: string } | undefined;
+        if (lastFailedVerify && lastFailedVerify.outcome) {
+          prompt += `\n\nPrevious verification failed with the following output:\n${lastFailedVerify.outcome}`;
+        }
+
+        let isCompliant = false;
+        if (project.contract_json) {
+          try {
+            const parsed = JSON.parse(project.contract_json);
+            if (parsed && parsed.isCompliant) {
+              isCompliant = true;
+            }
+          } catch {
+            // ignore
+          }
+        }
+        if (!isCompliant) {
+          prompt += "\n\npart of your job is to make this repo compliant — add the Dockerfile, compose environment with healthcheck, and (for UI projects) e2e tests.";
+        }
+      }
+
       // Call startRun
       const startResult = (await client.call("startRun", {
         taskId: run.task_num,
         phase: run.phase,
         provider: run.provider,
         model: run.model,
-        prompt: run.prompt || "",
+        prompt,
       })) as any;
 
       activeRunnerRunIds.set(run.id, startResult.runId);
@@ -216,6 +243,27 @@ export class QueueManager {
         await client.call("commitAndPush", { branch: "" });
       }
 
+      // Copy verify artifacts if the phase is "verify" and there is a verify-artifacts directory
+      if (run.phase === "verify") {
+        const repoPmDir = pmDirFor(project.repo_dir);
+        const runArtifactsSrcDir = join(repoPmDir, "verify-artifacts", String(startResult.runId));
+        const artifactsDestDir = join(process.env.PM_DATA_DIR || ".", "artifacts", String(run.id));
+        
+        try {
+          await mkdir(artifactsDestDir, { recursive: true });
+          const files = await readdir(runArtifactsSrcDir);
+          for (const file of files) {
+            await copyFile(join(runArtifactsSrcDir, file), join(artifactsDestDir, file));
+          }
+          // Update DB row with artifacts directory
+          this.db
+            .prepare("UPDATE runs SET artifacts_dir = ? WHERE id = ?")
+            .run(artifactsDestDir, run.id);
+        } catch {
+          // ignore if no artifacts or copy failed
+        }
+      }
+
       this.db
         .prepare(
           "UPDATE runs SET status = ?, exit_code = ?, cost_usd = ?, tokens_in = ?, tokens_out = ?, finished_at = ?, log_path = ? WHERE id = ?",
@@ -230,6 +278,19 @@ export class QueueManager {
           logFilePath,
           run.id,
         );
+
+      // Auto-run verify after a successful implement run
+      if (run.phase === "implement" && status === "succeeded") {
+        this.db.prepare(
+          "INSERT INTO runs (project_id, task_num, phase, provider, model, prompt, status, created_at) VALUES (?, ?, 'verify', ?, ?, '', 'queued', ?)"
+        ).run(
+          project.id,
+          run.task_num,
+          run.provider,
+          run.model,
+          new Date().toISOString()
+        );
+      }
     } catch (err) {
       console.error(`Error executing run ${run.id}:`, err);
       this.db

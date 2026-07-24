@@ -51,10 +51,22 @@ export function Header({ projects, currentProject, activeTab, theme, onToggleThe
       <input className="search" placeholder="search tasks, specs, adrs…" aria-label="search" />
       <span className="spacer" />
       {current && (
-        <span className="chip" title={`runner: ${current.runnerState}`}>
-          <span className={`dot${current.runnerState === "connected" ? " live" : ""}`} />
-          {current.lifecycle}
-        </span>
+        <>
+          <span
+            className={`chip compliance-badge ${current.contract?.isCompliant ? "compliant" : "non-compliant"}`}
+            title={
+              current.contract?.isCompliant
+                ? "Repository matches PM compliance contract"
+                : "Repository does not match PM compliance contract"
+            }
+          >
+            {current.contract?.isCompliant ? "✓ compliant" : "✗ non-compliant"}
+          </span>
+          <span className="chip" title={`runner: ${current.runnerState}`}>
+            <span className={`dot${current.runnerState === "connected" ? " live" : ""}`} />
+            {current.lifecycle}
+          </span>
+        </>
       )}
       <button type="button" className="btn" onClick={onToggleTheme} aria-label="toggle theme">
         {theme === "dark" ? "☀" : "☾"}
