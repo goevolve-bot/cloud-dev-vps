@@ -3,8 +3,11 @@ import { openDb } from "./db/connection.js";
 import { migrateUp } from "./db/migrate.js";
 import { RunnerRegistry } from "./runners/registry.js";
 
+// Defaults mirror the bind mounts in compose.yaml: everything the server must
+// keep across a container recreate lives under /srv/pm/data on the host, and
+// nothing defaults to a path that only exists inside the image.
 const port = Number(process.env.PORT ?? 3000);
-const dbPath = process.env.PM_DB_PATH ?? "/var/lib/pm/pm.sqlite3";
+const dbPath = process.env.PM_DB_PATH ?? "/srv/pm/data/pm.sqlite3";
 const runnersDir = process.env.PM_RUNNERS_DIR ?? "/srv/pm/runners";
 
 const db = openDb(dbPath);

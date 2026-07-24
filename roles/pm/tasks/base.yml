@@ -72,6 +72,10 @@
     reload: true
 
 # ── 5. /srv/pm directory tree ────────────────────────────────────────────
+# Every path here is either bind-mounted into the pm container (see the
+# `volumes:` block in app/compose.yaml) or named in pm-projectctl's
+# DEFAULT_CONFIG. They must exist before the stack starts: Docker silently
+# materialises a missing bind source as a root-owned directory otherwise.
 
 - name: Create /srv/pm directory tree
   file:
@@ -81,12 +85,23 @@
     group: "{{ item.group | default(pm_group) }}"
     mode: "{{ item.mode | default('0750') }}"
   loop:
-    - { path: /srv/pm }
-    - { path: /srv/pm/runners }
+    # projectctl.sock lives here; root-owned so only root can (re)create it,
+    # group pm so the pm container can connect. o+x — not o+r — because the
+    # per-project runners execute out of /srv/pm/app and project users are
+    # deliberately NOT in the pm group, so they need traversal and nothing
+    # else. The sensitive children below stay 0750.
+    - { path: /srv/pm, owner: root, group: "{{ pm_group }}", mode: "0751" }
+    # One directory per project, each holding that project's runner socket.
+    # pm-projectctl re-asserts root:pm 0755 on this; match it so the first
+    # `create` is not a permission change.
+    - { path: /srv/pm/runners, owner: root, group: "{{ pm_group }}", mode: "0755" }
+    # pm-projectctl's state_dir — project metadata, root-owned, pm-readable.
+    - { path: /srv/pm/projects, owner: root, group: "{{ pm_group }}", mode: "0750" }
+    # PM_DATA_DIR. queue.ts writes run logs to <data>/logs and copies verify
+    # artifacts to <data>/artifacts/<runId>; pm.sqlite3 lives here too.
     - { path: /srv/pm/data }
-    - { path: /srv/pm/data/runs }
-    # projectctl.sock lives here; owned root:pm so the pm container can connect
-    - { path: /srv/pm, owner: root, group: "{{ pm_group }}", mode: "0750" }
+    - { path: /srv/pm/data/logs }
+    - { path: /srv/pm/data/artifacts }
 
 # ── 6. Deploy app source ─────────────────────────────────────────────────
 
@@ -96,7 +111,11 @@
     state: directory
     owner: "{{ pm_user }}"
     group: "{{ pm_group }}"
-    mode: "0750"
+    # World-readable: project users (pm-<name>, never members of the pm group)
+    # exec the runner from {{ pm_app_dest }}/runner/dist. Contents are source
+    # code and build output only — the one secret in the tree, auth/htpasswd,
+    # gets its own mode in nginx_tls.yml.
+    mode: "0755"
 
 - name: Synchronise app/ source to {{ pm_app_dest }}
   synchronize:

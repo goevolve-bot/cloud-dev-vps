@@ -18,12 +18,15 @@ services:
         fi
 
   # One-shot: generate the basic-auth htpasswd file if one isn't there yet.
-  # Dev-only defaults below; the real deploy renders this from a vaulted
-  # Ansible var (roles/pm, T40) instead.
+  # Dev-only defaults below. On a real deploy Ansible (roles/pm T40) has
+  # already written ./auth/htpasswd from a vaulted var, and the `[ ! -f ]`
+  # guard makes this a no-op — that is why the directory is bind-mounted
+  # rather than a named volume: a named volume is invisible to Ansible, so
+  # the vaulted password was generated and then never read (review §5.3).
   auth-init:
     image: httpd:2.4-alpine
     volumes:
-      - auth:/auth
+      - ./auth:/auth
     environment:
       PM_AUTH_USER: "${PM_AUTH_USER:-admin}"
       PM_AUTH_PASSWORD: "${PM_AUTH_PASSWORD:-changeme}"
@@ -32,7 +35,13 @@ services:
       - |
         set -e
         if [ ! -f /auth/htpasswd ]; then
-          htpasswd -bc /auth/htpasswd "$$PM_AUTH_USER" "$$PM_AUTH_PASSWORD"
+          htpasswd -Bbc /auth/htpasswd "$$PM_AUTH_USER" "$$PM_AUTH_PASSWORD"
+          # nginx reads auth_basic_user_file from its *worker*, which runs as
+          # the image's unprivileged `nginx` user — not as the owner of this
+          # file. Under rootless Docker that uid maps outside the pm user
+          # entirely, so the file has to be world-readable to be usable at all.
+          # It holds bcrypt hashes only, which is why -B above is not optional.
+          chmod 0644 /auth/htpasswd
         fi
 
   pm:
@@ -44,6 +53,40 @@ services:
       - "3000"
     environment:
       PORT: "3000"
+      # Everything below points at the bind mounts declared under `volumes:`.
+      # Without them the server writes its database and run logs into the
+      # container's own filesystem and loses them on every recreate.
+      PM_DB_PATH: /srv/pm/data/pm.sqlite3
+      PM_DATA_DIR: /srv/pm/data
+      PM_RUNNERS_DIR: /srv/pm/runners
+    volumes:
+      # The whole of /srv/pm rather than just projectctl.sock: the socket is
+      # systemd-socket-activated, so `systemctl restart pm-projectctl.socket`
+      # unlinks and recreates it. A bind mount of the file itself pins the old
+      # inode and the container keeps talking to a socket nobody listens on;
+      # worse, on a first deploy the socket does not exist yet when the stack
+      # starts and Docker would silently create a *directory* in its place.
+      # Mounting the parent directory tracks the real file through both.
+      #
+      # This also exposes /srv/pm/app (the deployed app tree, see roles/pm
+      # pm_app_dest) to the container read-write. That grants nothing new: the
+      # container runs as container-root, which rootless Docker maps to host
+      # uid `pm`, and `pm` already owns that tree — it is the user the compose
+      # stack is launched from.
+      - /srv/pm:/srv/pm
+      # Nested on top of the mount above. pm only ever *connects* to a
+      # project's runner socket, it never creates one, so read-only is right.
+      # (Belt and braces: the directory is root:pm 0755 on the host anyway.)
+      - /srv/pm/runners:/srv/pm/runners:ro
+      # Project work trees are /home/pm-<name>/work/<repo>, and projects are
+      # created *after* the stack is up — a mount list fixed at compose time
+      # cannot enumerate them, so the parent directory is the only mount that
+      # can work. Less blunt than it looks: every access is still made as host
+      # uid `pm`, and project trees are 2770 pm-<name>:pm with `pm` as the
+      # shared group, so the container reaches exactly the projects the
+      # on-host permission model already grants it — /home/<dev_user> (0750,
+      # owned by that user) stays unreadable.
+      - /home:/home
 
   nginx:
     image: nginx:1.27-alpine
@@ -58,10 +101,10 @@ services:
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - certs:/etc/nginx/certs:ro
-      - auth:/etc/nginx/auth:ro
+      # Same directory Ansible renders the htpasswd into (roles/pm T40).
+      - ./auth:/etc/nginx/auth:ro
     ports:
       - "443:443"
 
 volumes:
   certs:
-  auth:

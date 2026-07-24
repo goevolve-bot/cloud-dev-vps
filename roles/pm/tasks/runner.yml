@@ -1,0 +1,149 @@
+---
+# --------------------------------------------------------------------------
+# roles/pm — per-project runner deployment
+#
+# pm-projectctl's install_runner() renders a systemd *user* unit per project
+# whose ExecStart is cfg.runner_exec, i.e.
+#
+#     /usr/bin/node /srv/pm/app/runner/dist/index.js
+#
+# and it refuses to install a runner at all when runner_exec[0] does not exist
+# (see the os.path.exists guard in install_runner). Nothing else in this role
+# put either half of that command line on the host: the app sync excludes
+# */dist and no build ever ran outside the container image. Result was that
+# every project's runner failed to start, so the pm server never saw a runner
+# socket and every project read as `disconnected`.
+#
+# Three references have to agree on that path. They now do, without any
+# /etc/pm-projectctl.conf override:
+#   - pm-projectctl DEFAULT_CONFIG["runner_exec"] — /srv/pm/app/runner/dist
+#   - pm_app_dest (roles/pm/defaults/main.yml)    — /srv/pm/app
+#   - this file, which builds into {{ pm_app_dest }}/runner/dist
+# --------------------------------------------------------------------------
+
+# ── 1. System-wide Node at /usr/bin/node ─────────────────────────────────
+# roles/dev_tools installs Node through nvm under dev_user's home; that is
+# invisible to root and to the pm-<name> project users, and its path moves
+# with every version bump. The runner unit hardcodes /usr/bin/node, so pin an
+# official build instead of depending on whatever the distro ships.
+
+- name: Install Node tarball prerequisites
+  apt:
+    name:
+      - xz-utils
+      - ca-certificates
+    state: present
+
+- name: Create Node install directory
+  file:
+    path: /opt/nodejs
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Set Node distribution facts
+  set_fact:
+    pm_node_arch: "{{ pm_node_arch_map.get(ansible_facts['architecture'], ansible_facts['architecture']) }}"
+
+- name: Set Node install path fact
+  set_fact:
+    pm_node_dir: "/opt/nodejs/node-v{{ pm_node_version }}-linux-{{ pm_node_arch }}"
+
+- name: Download and unpack Node {{ pm_node_version }}
+  unarchive:
+    src: "https://nodejs.org/dist/v{{ pm_node_version }}/node-v{{ pm_node_version }}-linux-{{ pm_node_arch }}.tar.xz"
+    dest: /opt/nodejs
+    remote_src: true
+    owner: root
+    group: root
+    creates: "{{ pm_node_dir }}/bin/node"
+
+- name: Link /usr/bin/node to the pinned Node build
+  file:
+    src: "{{ pm_node_dir }}/bin/node"
+    dest: /usr/bin/node
+    state: link
+    force: true
+
+# ── 2. pnpm on the host ──────────────────────────────────────────────────
+# Pinned rather than left to Corepack's "latest known good", because the
+# workspace lockfile is lockfileVersion 9.0 and --frozen-lockfile below is
+# only meaningful if the reader understands that format.
+
+- name: Activate pinned pnpm via Corepack
+  command: "{{ pm_node_dir }}/bin/corepack prepare pnpm@{{ pm_pnpm_version }} --activate"
+  environment:
+    PATH: "{{ pm_node_dir }}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  # Corepack caches the download, so re-running is a no-op it cannot report.
+  changed_when: false
+
+- name: Install pnpm shim into /usr/local/bin
+  command: "{{ pm_node_dir }}/bin/corepack enable --install-directory /usr/local/bin"
+  environment:
+    PATH: "{{ pm_node_dir }}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  args:
+    creates: /usr/local/bin/pnpm
+
+# ── 3. Build @pm/runner (and its @pm/core dependency) in place ───────────
+# In place, not built-then-copied: the runner resolves the bare specifier
+# "@pm/core" by walking up from {{ pm_app_dest }}/runner/dist, and pnpm's
+# node_modules for that package is a symlink farm pointing back into
+# {{ pm_app_dest }}. Detaching dist/ from the tree would break resolution.
+#
+# Run as {{ pm_user }} so the resulting tree stays owned by the user that owns
+# the rest of {{ pm_app_dest }}. CI=true keeps pnpm from prompting about
+# purging node_modules when the filter set changes.
+
+- name: Install runner dependencies with pnpm
+  become: true
+  become_user: "{{ pm_user }}"
+  command:
+    cmd: /usr/local/bin/pnpm install --frozen-lockfile --filter "@pm/runner..."
+    chdir: "{{ pm_app_dest }}"
+  environment:
+    HOME: "/home/{{ pm_user }}"
+    CI: "true"
+    PATH: "/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
+  register: pm_runner_install
+  changed_when: "'Already up to date' not in pm_runner_install.stdout"
+
+- name: Build @pm/core and @pm/runner
+  become: true
+  become_user: "{{ pm_user }}"
+  command:
+    cmd: /usr/local/bin/pnpm --filter "@pm/runner..." run build
+    chdir: "{{ pm_app_dest }}"
+  environment:
+    HOME: "/home/{{ pm_user }}"
+    CI: "true"
+    PATH: "/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
+  changed_when: true
+
+# ── 4. Prove the unit's ExecStart resolves ───────────────────────────────
+# Cheap here, expensive later: without this the failure surfaces as a project
+# that creates cleanly and then never connects.
+
+- name: Check the runner entrypoint exists
+  stat:
+    path: "{{ pm_app_dest }}/runner/dist/index.js"
+  register: pm_runner_entrypoint
+
+- name: Fail if the runner entrypoint is missing
+  assert:
+    that:
+      - pm_runner_entrypoint.stat.exists
+    fail_msg: >-
+      {{ pm_app_dest }}/runner/dist/index.js was not produced by the build.
+      pm-projectctl execs exactly this path, so no project runner can start.
+
+# Project users (pm-<name>) are deliberately not in the pm group, so they reach
+# the runner through the world-execute bits only: /srv/pm is 0751 and
+# {{ pm_app_dest }} is 0755 (both set in base.yml §5/§6). pnpm writes 0755
+# directories and 0644 files under the default umask, so nothing further is
+# needed — checked rather than assumed, since a stricter umask would break it
+# silently at project-create time. runuser, not become_user: this has to run as
+# an account with no group overlap with pm, which is the whole point.
+- name: Verify the runner tree is reachable by a non-pm account
+  command: "runuser -u nobody -- test -r {{ pm_app_dest }}/runner/dist/index.js"
+  changed_when: false

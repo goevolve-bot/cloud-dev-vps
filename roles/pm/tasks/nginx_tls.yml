@@ -5,9 +5,11 @@
 # generates a self-signed origin cert into a named volume (idempotent), and
 # writes the htpasswd file from a vaulted variable.
 #
-# Variable required in group_vars (vault-encrypted recommended):
+# Variable required in group_vars, vault-encrypted:
 #   pm_auth_password  — password for the basic-auth user "pm"
 #   pm_auth_user      — (optional, default "pm") basic-auth username
+# There is deliberately no default for pm_auth_password anywhere in the repo;
+# see the assert below.
 # --------------------------------------------------------------------------
 
 - name: Set pm_auth_user default
@@ -35,10 +37,13 @@
 # is up (done by base.yml T39).
 
 # ── 3. htpasswd ──────────────────────────────────────────────────────────
-# We generate the htpasswd file on the host and place it in a path that the
-# auth-init service will copy into the named volume on first start.
-# If the volume already has the file we overwrite it in place by running a
-# docker exec; this keeps auth changes effective without a full stack restart.
+# {{ pm_app_dest }}/auth is bind-mounted straight into nginx as
+# /etc/nginx/auth (app/compose.yaml), so the file written here is literally the
+# one nginx reads. It used to land in the app tree while nginx read a *named
+# volume* populated by the auth-init one-shot — so the vaulted password was
+# generated and then ignored, and production ran on admin/changeme (review
+# §5.3). auth-init still exists for local dev but only creates the file when it
+# is absent, so it can no longer overwrite this one.
 
 - name: Install apache2-utils for htpasswd
   apt:
@@ -48,27 +53,39 @@
 - name: Generate htpasswd file for pm auth
   become: true
   become_user: "{{ pm_user }}"
-  shell: >
-    htpasswd -bc /tmp/pm-htpasswd "{{ pm_auth_user }}" "{{ pm_auth_password }}"
+  # -B = bcrypt. Required, not cosmetic: the file has to be world-readable (see
+  # the mode below), so the hash is the only thing protecting the password.
+  command:
+    argv:
+      - htpasswd
+      - -Bbc
+      - /tmp/pm-htpasswd
+      - "{{ pm_auth_user }}"
+      - "{{ pm_auth_password }}"
   no_log: true
   changed_when: true
 
-- name: Ensure auth volume directory exists in app tree (fallback for first run)
+- name: Ensure auth directory exists in app tree
   file:
     path: "{{ pm_app_dest }}/auth"
     state: directory
     owner: "{{ pm_user }}"
     group: "{{ pm_group }}"
-    mode: "0700"
+    mode: "0755"
 
-- name: Copy htpasswd into app auth directory (picked up by auth-init)
+- name: Install htpasswd where nginx reads it
   copy:
     src: /tmp/pm-htpasswd
     dest: "{{ pm_app_dest }}/auth/htpasswd"
     remote_src: true
     owner: "{{ pm_user }}"
     group: "{{ pm_group }}"
-    mode: "0600"
+    # nginx parses auth_basic_user_file in its worker process, which the
+    # official image runs as the unprivileged `nginx` user. Under rootless
+    # Docker that uid maps into pm's subuid range — it is neither the file's
+    # owner nor in its group — so 0600 would make nginx fail to authenticate
+    # anyone. bcrypt above is what makes 0644 acceptable.
+    mode: "0644"
   no_log: true
   notify: restart pm compose
 

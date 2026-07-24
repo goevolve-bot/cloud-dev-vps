@@ -50,7 +50,9 @@
     state: directory
     owner: root
     group: "{{ pm_group }}"
-    mode: "0750"
+    # Must match base.yml §5 — 0751, not 0750. Project users are not in the pm
+    # group and still have to traverse into /srv/pm/app to exec their runner.
+    mode: "0751"
 
 # ── 4. Enable and start socket ───────────────────────────────────────────
 

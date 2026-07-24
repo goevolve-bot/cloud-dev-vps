@@ -5,3 +5,6 @@ dist/
 # python bytecode from app/scripts (pm-projectctl tests)
 __pycache__/
 *.pyc
+
+# generated basic-auth file (see compose.yaml auth-init / roles/pm T40)
+auth/htpasswd

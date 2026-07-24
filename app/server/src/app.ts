@@ -1,8 +1,10 @@
+import fastifyStatic from "@fastify/static";
 import type Database from "better-sqlite3";
 import Fastify, { type FastifyInstance } from "fastify";
 import { existsSync, readFileSync } from "node:fs";
 import { readdir } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   addComment,
   createTask,
@@ -119,6 +121,17 @@ const SAFE_FILENAME_RE = /^[^/\\]+$/;
 
 function isSafeFilename(name: string): boolean {
   return SAFE_FILENAME_RE.test(name) && name !== "." && name !== ".." && !name.includes("\0");
+}
+
+/**
+ * Where the built SPA lives. In the server image (server/Dockerfile) the
+ * workspace is laid out at /repo, this module compiles to /repo/server/dist/,
+ * and vite writes /repo/web/dist — hence two levels up. Running the server
+ * straight from a source checkout gives the same relative answer.
+ */
+function resolveWebRoot(): string {
+  if (process.env.PM_WEB_DIR) return process.env.PM_WEB_DIR;
+  return resolve(dirname(fileURLToPath(import.meta.url)), "../../web/dist");
 }
 
 export function buildApp(ctx: AppContext): FastifyInstance {
@@ -747,6 +760,30 @@ export function buildApp(ctx: AppContext): FastifyInstance {
     const updated = getProjectRow(name)!;
     return serializeProject(updated, runners.state(updated.name));
   });
+
+  // ─── Static SPA ──────────────────────────────────────────────────────────
+  // nginx proxies `location /` straight here, so the API server is also the
+  // origin for the UI. Skipped when web/dist is absent (unit tests, and any
+  // API-only run) so the tests keep getting JSON 404s.
+
+  const webRoot = resolveWebRoot();
+  if (existsSync(webRoot)) {
+    // wildcard:false registers one route per built file instead of a catch-all
+    // `/*`. That matters: a catch-all would also swallow unmatched /api/…
+    // requests and answer them with @fastify/static's HTML-ish 404 instead of
+    // the JSON shape the client expects.
+    app.register(fastifyStatic, { root: webRoot, wildcard: false });
+
+    // Client-side routes (/specs, /adrs, /projects/x/tasks/1) have no file
+    // behind them; hand them index.html and let react-router resolve. Anything
+    // under /api, and anything that isn't a GET, still 404s as JSON.
+    app.setNotFoundHandler((request, reply) => {
+      if (request.method !== "GET" || request.url.startsWith("/api/")) {
+        return reply.code(404).send({ error: "not_found" });
+      }
+      return reply.sendFile("index.html");
+    });
+  }
 
   return app;
 }

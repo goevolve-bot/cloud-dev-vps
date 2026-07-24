@@ -11,9 +11,15 @@ pm_group: pm
 # Where pm-projectctl lands on the host
 pm_projectctl_bin: /usr/local/sbin/pm-projectctl
 
-# Where the app checkout lives (Ansible deploys from the control node)
+# Where the app checkout lives (Ansible deploys from the control node).
+# This has to be /srv/pm/app, not somewhere in /opt: pm-projectctl's
+# DEFAULT_CONFIG execs the per-project runner as
+# /usr/bin/node /srv/pm/app/runner/dist/index.js, and the runner resolves
+# @pm/core through the pnpm node_modules tree that sits beside it. Moving the
+# tree means overriding runner_exec in /etc/pm-projectctl.conf as well; keeping
+# the default true is the cheaper contract.
 pm_app_src: "{{ playbook_dir }}/app"
-pm_app_dest: /opt/pm/app
+pm_app_dest: /srv/pm/app
 
 # Compose project name (also used as the systemd unit name)
 pm_compose_project: pm
@@ -21,8 +27,26 @@ pm_compose_project: pm
 # Listening port inside the compose network (nginx → pm container)
 pm_backend_port: 3000
 
-# sysctl: allow rootless Docker (and our nginx on :443) to bind low ports
-pm_sysctl_unprivileged_port_start: 80
+# sysctl: allow rootless Docker (and our nginx on :443) to bind low ports.
+# 443 and not 80: the stack has no plaintext :80 listener by design, and every
+# port below this value stays root-only. Lowering it to 80 would hand every
+# unprivileged user on the box the ability to bind :80 for nothing in return.
+pm_sysctl_unprivileged_port_start: 443
+
+# Node runtime for the per-project runners. pm-projectctl renders a systemd
+# unit whose ExecStart is literally /usr/bin/node and refuses to install a
+# runner when that path is missing, so the host needs a system-wide Node — the
+# nvm install in roles/dev_tools belongs to dev_user and is not on root's PATH.
+# Kept on the same major as the server image (node:22-alpine).
+pm_node_version: "22.14.0"
+# Must be a pnpm major that reads lockfileVersion 9.0 (app/pnpm-lock.yaml),
+# otherwise the --frozen-lockfile install of @pm/runner cannot verify anything.
+pm_pnpm_version: "10.11.0"
+pm_node_arch_map:
+  x86_64: x64
+  aarch64: arm64
+  arm64: arm64
+  armv7l: armv7l
 
 # Cloudflare IP ranges (fetched from https://www.cloudflare.com/ips-v4 and
 # https://www.cloudflare.com/ips-v6, 2026). Used in both nftables (T42) and

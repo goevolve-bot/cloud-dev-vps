@@ -1,0 +1,10 @@
+# The build context is this workspace root, and on a deployed host the same
+# tree also carries a host-side `pnpm install` for @pm/runner (roles/pm
+# runner.yml) plus its build output. Neither must leak into the image: the
+# Dockerfile installs and builds everything it needs from the lockfile.
+node_modules
+**/node_modules
+**/dist
+
+.git
+auth

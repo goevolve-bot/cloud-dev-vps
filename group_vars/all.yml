@@ -5,8 +5,14 @@ git_user_name: Constantin Titarenko
 git_user_email: i.const.t@gmail.com
 
 # PM system basic-auth credentials.
-# Replace pm_auth_password with an ansible-vault encrypted string before
-# running against production:
+#
+# pm_auth_password is intentionally NOT defined here. It is the only thing
+# standing between the public internet and the PM UI, and a default — even one
+# labelled "replace me" — is a default that ships. roles/pm asserts it is set
+# and refuses to run without it, so the play fails loudly rather than deploying
+# a password that is in this repo's git history.
+#
+# Add it as a vault-encrypted string:
 #   ansible-vault encrypt_string 'yourpassword' --name pm_auth_password
+# and paste the result below.
 pm_auth_user: pm
-pm_auth_password: changeme   # REPLACE with vault-encrypted value

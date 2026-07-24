@@ -3,13 +3,33 @@
 # roles/pm — main entry point
 # Calls sub-task files in dependency order:
 #   base.yml       → T39  pm user, rootless dockerd, dirs, sysctl, stack up
+#   runner.yml     →      system Node + built @pm/runner at pm-projectctl's
+#                         runner_exec path (needs base.yml's app sync)
 #   nginx_tls.yml  → T40  nginx conf, self-signed cert, htpasswd
 #   projectctl.yml → T41  pm-projectctl binary + units
 # T42 (nftables 443 rule) is handled by roles/nftables via the pm_* vars.
 # --------------------------------------------------------------------------
 
+# Checked before anything runs, not at the point of use in nginx_tls.yml:
+# base.yml brings the stack up, and a stack that comes up without a password
+# set falls back to compose's auth-init one-shot — which publishes the UI on
+# admin/changeme (review §5.3). Failing first means that never happens.
+- name: Require a real basic-auth password
+  assert:
+    that:
+      - pm_auth_password is defined
+      - pm_auth_password | length > 0
+      - pm_auth_password != 'changeme'
+    fail_msg: >-
+      pm_auth_password is unset (or still the old 'changeme' placeholder).
+      Set it in group_vars/all.yml as a vault-encrypted string:
+      ansible-vault encrypt_string 'yourpassword' --name pm_auth_password
+
 - name: T39 — pm base (user, docker, dirs, sysctl, compose stack)
   include_tasks: base.yml
+
+- name: Build and deploy the per-project runner
+  include_tasks: runner.yml
 
 - name: T40 — nginx TLS + auth
   include_tasks: nginx_tls.yml
