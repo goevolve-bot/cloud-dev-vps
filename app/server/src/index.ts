@@ -1,19 +1,24 @@
-import { createServer } from "node:http";
+import { buildApp } from "./app.js";
+import { openDb } from "./db/connection.js";
+import { migrateUp } from "./db/migrate.js";
+import { RunnerRegistry } from "./runners/registry.js";
 
-// Placeholder health-check server. The real Fastify API (REST, SSE, SPA
-// static serving) lands in T12 — see docs/pm-task-breakdown.md.
 const port = Number(process.env.PORT ?? 3000);
+const dbPath = process.env.PM_DB_PATH ?? "/var/lib/pm/pm.sqlite3";
+const runnersDir = process.env.PM_RUNNERS_DIR ?? "/srv/pm/runners";
 
-const server = createServer((req, res) => {
-  if (req.url === "/health") {
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ status: "ok" }));
-    return;
-  }
-  res.writeHead(404);
-  res.end();
-});
+const db = openDb(dbPath);
+migrateUp(db);
 
-server.listen(port, () => {
-  console.log(`pm server listening on :${port}`);
-});
+const runners = new RunnerRegistry({ runnersDir });
+await runners.start();
+
+const app = buildApp({ db, runners });
+
+try {
+  const address = await app.listen({ port, host: "0.0.0.0" });
+  console.log(`pm server listening on ${address}`);
+} catch (err) {
+  app.log.error(err);
+  process.exit(1);
+}
