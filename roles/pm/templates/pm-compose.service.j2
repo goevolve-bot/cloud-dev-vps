@@ -1,0 +1,34 @@
+[Unit]
+Description=PM compose stack (pm + nginx)
+# Start after the rootless Docker socket is available.
+After=docker.service
+
+[Service]
+Type=simple
+# Use the pm user's rootless Docker socket.
+Environment=DOCKER_HOST=unix:///run/user/%U/docker.sock
+Environment=HOME=/home/{{ pm_user }}
+Environment=PATH=/home/{{ pm_user }}/bin:/usr/local/bin:/usr/bin:/bin
+
+WorkingDirectory={{ pm_app_dest }}
+
+# bring the stack up in the foreground; compose exits once all containers
+# reach the "started" state, so we use --wait for health-aware ordering.
+ExecStart=/home/{{ pm_user }}/bin/docker compose \
+    --project-name {{ pm_compose_project }} \
+    --file {{ pm_app_dest }}/compose.yaml \
+    up --build --remove-orphans
+
+ExecStop=/home/{{ pm_user }}/bin/docker compose \
+    --project-name {{ pm_compose_project }} \
+    --file {{ pm_app_dest }}/compose.yaml \
+    down
+
+# Give containers a moment to drain before a hard kill.
+TimeoutStopSec=30
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

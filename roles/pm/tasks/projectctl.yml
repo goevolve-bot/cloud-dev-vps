@@ -1,0 +1,67 @@
+---
+# --------------------------------------------------------------------------
+# T41 — roles/pm — pm-projectctl install
+# Deploys the helper binary and its systemd socket + service units to the
+# host.  After this task the socket is active and both the pm container and
+# root scripts can drive create/start/stop/delete.
+# --------------------------------------------------------------------------
+
+# ── 1. Deploy binary ─────────────────────────────────────────────────────
+
+- name: Deploy pm-projectctl binary
+  copy:
+    src: "{{ pm_app_src }}/scripts/pm-projectctl"
+    dest: "{{ pm_projectctl_bin }}"
+    owner: root
+    group: root
+    mode: "0755"
+  notify: reload systemd daemon
+
+# ── 2. Deploy systemd socket + service units ─────────────────────────────
+
+- name: Deploy pm-projectctl.socket
+  copy:
+    src: "{{ pm_app_src }}/scripts/pm-projectctl.socket"
+    dest: /etc/systemd/system/pm-projectctl.socket
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload systemd daemon
+
+- name: Deploy pm-projectctl.service
+  copy:
+    src: "{{ pm_app_src }}/scripts/pm-projectctl.service"
+    dest: /etc/systemd/system/pm-projectctl.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload systemd daemon
+
+- name: Flush handlers so systemd knows about the new units
+  meta: flush_handlers
+
+# ── 3. Ensure /srv/pm exists (socket path) ───────────────────────────────
+# base.yml creates /srv/pm; this is a safety guard in case projectctl.yml
+# runs independently.
+
+- name: Ensure /srv/pm directory exists (socket dir)
+  file:
+    path: /srv/pm
+    state: directory
+    owner: root
+    group: "{{ pm_group }}"
+    mode: "0750"
+
+# ── 4. Enable and start socket ───────────────────────────────────────────
+
+- name: Enable and start pm-projectctl.socket
+  systemd:
+    name: pm-projectctl.socket
+    daemon_reload: true
+    state: started
+    enabled: true
+
+- name: Ensure pm-projectctl.service is enabled (socket-activated)
+  systemd:
+    name: pm-projectctl.service
+    enabled: true

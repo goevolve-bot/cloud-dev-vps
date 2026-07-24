@@ -1,0 +1,66 @@
+---
+# --------------------------------------------------------------------------
+# roles/pm — defaults
+# Override these in group_vars/all.yml or host_vars/ as needed.
+# --------------------------------------------------------------------------
+
+# User and group that own the PM stack
+pm_user: pm
+pm_group: pm
+
+# Where pm-projectctl lands on the host
+pm_projectctl_bin: /usr/local/sbin/pm-projectctl
+
+# Where the app checkout lives (Ansible deploys from the control node)
+pm_app_src: "{{ playbook_dir }}/app"
+pm_app_dest: /opt/pm/app
+
+# Compose project name (also used as the systemd unit name)
+pm_compose_project: pm
+
+# Listening port inside the compose network (nginx → pm container)
+pm_backend_port: 3000
+
+# sysctl: allow rootless Docker (and our nginx on :443) to bind low ports
+pm_sysctl_unprivileged_port_start: 80
+
+# Cloudflare IP ranges (fetched from https://www.cloudflare.com/ips-v4 and
+# https://www.cloudflare.com/ips-v6, 2026). Used in both nftables (T42) and
+# nginx real_ip_from (T40). Refresh these periodically.
+cloudflare_ipv4_ranges:
+  - 173.245.48.0/20
+  - 103.21.244.0/22
+  - 103.22.200.0/22
+  - 103.31.4.0/22
+  - 141.101.64.0/18
+  - 108.162.192.0/18
+  - 190.93.240.0/20
+  - 188.114.96.0/20
+  - 197.234.240.0/22
+  - 198.41.128.0/17
+  - 162.158.0.0/15
+  - 104.16.0.0/13
+  - 104.24.0.0/14
+  - 172.64.0.0/13
+  - 131.0.72.0/22
+
+cloudflare_ipv6_ranges:
+  - 2400:cb00::/32
+  - 2606:4700::/32
+  - 2803:f800::/32
+  - 2405:b500::/32
+  - 2405:8100::/32
+  - 2a06:98c0::/29
+  - 2c0f:f248::/32
+
+# Whether to scope nftables rule 443 to Cloudflare ranges only (recommended
+# for production; set false if you need direct access during troubleshooting).
+pm_nftables_cloudflare_only: true
+
+# Docker Compose version (re-uses the same default as dev_tools)
+docker_compose_version: v2.39.1
+docker_compose_arch_map:
+  x86_64: x86_64
+  aarch64: aarch64
+  arm64: aarch64
+  armv7l: armv7

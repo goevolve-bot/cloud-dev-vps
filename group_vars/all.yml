@@ -3,3 +3,10 @@ dev_user: debian
 github_username: titarenko
 git_user_name: Constantin Titarenko
 git_user_email: i.const.t@gmail.com
+
+# PM system basic-auth credentials.
+# Replace pm_auth_password with an ansible-vault encrypted string before
+# running against production:
+#   ansible-vault encrypt_string 'yourpassword' --name pm_auth_password
+pm_auth_user: pm
+pm_auth_password: changeme   # REPLACE with vault-encrypted value

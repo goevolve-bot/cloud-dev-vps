@@ -1,0 +1,18 @@
+---
+# --------------------------------------------------------------------------
+# roles/pm — main entry point
+# Calls sub-task files in dependency order:
+#   base.yml       → T39  pm user, rootless dockerd, dirs, sysctl, stack up
+#   nginx_tls.yml  → T40  nginx conf, self-signed cert, htpasswd
+#   projectctl.yml → T41  pm-projectctl binary + units
+# T42 (nftables 443 rule) is handled by roles/nftables via the pm_* vars.
+# --------------------------------------------------------------------------
+
+- name: T39 — pm base (user, docker, dirs, sysctl, compose stack)
+  include_tasks: base.yml
+
+- name: T40 — nginx TLS + auth
+  include_tasks: nginx_tls.yml
+
+- name: T41 — pm-projectctl install
+  include_tasks: projectctl.yml

@@ -1,0 +1,26 @@
+---
+# --------------------------------------------------------------------------
+# roles/pm — handlers
+# --------------------------------------------------------------------------
+
+- name: reload systemd daemon
+  systemd:
+    daemon_reload: true
+
+- name: restart pm compose
+  # Runs as the pm user (systemd --user unit). We drive it with machinectl /
+  # systemctl --machine in the task; the handler just signals the unit.
+  become: true
+  become_user: "{{ pm_user }}"
+  systemd:
+    name: "pm-compose.service"
+    scope: user
+    state: restarted
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ pm_user_uid }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ pm_user_uid }}/bus"
+
+- name: reload nftables
+  service:
+    name: nftables
+    state: reloaded

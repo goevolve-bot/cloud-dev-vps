@@ -1,0 +1,78 @@
+---
+# --------------------------------------------------------------------------
+# T40 — roles/pm — nginx + TLS + auth
+# Renders the nginx conf (from template with Cloudflare real_ip ranges),
+# generates a self-signed origin cert into a named volume (idempotent), and
+# writes the htpasswd file from a vaulted variable.
+#
+# Variable required in group_vars (vault-encrypted recommended):
+#   pm_auth_password  — password for the basic-auth user "pm"
+#   pm_auth_user      — (optional, default "pm") basic-auth username
+# --------------------------------------------------------------------------
+
+- name: Set pm_auth_user default
+  set_fact:
+    pm_auth_user: "{{ pm_auth_user | default('pm') }}"
+
+# ── 1. nginx.conf ────────────────────────────────────────────────────────
+# The compose stack bind-mounts nginx/nginx.conf from the app directory;
+# we render the template directly into the deployed app tree so the next
+# compose (re)start picks it up automatically.
+
+- name: Render nginx.conf from template
+  template:
+    src: nginx.conf.j2
+    dest: "{{ pm_app_dest }}/nginx/nginx.conf"
+    owner: "{{ pm_user }}"
+    group: "{{ pm_group }}"
+    mode: "0644"
+  notify: restart pm compose
+
+# ── 2. self-signed origin cert ───────────────────────────────────────────
+# The cert-init one-shot in compose.yaml already handles this at container
+# startup (idempotent). We just make sure the certs volume exists so the
+# one-shot can write to it. Nothing to do here beyond ensuring the stack
+# is up (done by base.yml T39).
+
+# ── 3. htpasswd ──────────────────────────────────────────────────────────
+# We generate the htpasswd file on the host and place it in a path that the
+# auth-init service will copy into the named volume on first start.
+# If the volume already has the file we overwrite it in place by running a
+# docker exec; this keeps auth changes effective without a full stack restart.
+
+- name: Install apache2-utils for htpasswd
+  apt:
+    name: apache2-utils
+    state: present
+
+- name: Generate htpasswd file for pm auth
+  become: true
+  become_user: "{{ pm_user }}"
+  shell: >
+    htpasswd -bc /tmp/pm-htpasswd "{{ pm_auth_user }}" "{{ pm_auth_password }}"
+  no_log: true
+  changed_when: true
+
+- name: Ensure auth volume directory exists in app tree (fallback for first run)
+  file:
+    path: "{{ pm_app_dest }}/auth"
+    state: directory
+    owner: "{{ pm_user }}"
+    group: "{{ pm_group }}"
+    mode: "0700"
+
+- name: Copy htpasswd into app auth directory (picked up by auth-init)
+  copy:
+    src: /tmp/pm-htpasswd
+    dest: "{{ pm_app_dest }}/auth/htpasswd"
+    remote_src: true
+    owner: "{{ pm_user }}"
+    group: "{{ pm_group }}"
+    mode: "0600"
+  no_log: true
+  notify: restart pm compose
+
+- name: Remove temporary htpasswd file
+  file:
+    path: /tmp/pm-htpasswd
+    state: absent

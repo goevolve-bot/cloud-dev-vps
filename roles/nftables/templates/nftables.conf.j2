@@ -1,4 +1,5 @@
 #!/usr/sbin/nft -f
+# Rendered by Ansible (roles/nftables) — do not edit by hand.
 
 flush ruleset
 
@@ -15,6 +16,33 @@ table inet filter {
     flags dynamic, timeout
     timeout 15m
   }
+
+{% if pm_nftables_cloudflare_only | default(true) %}
+  # Cloudflare origin-pull IPv4 ranges (T42) — only Cloudflare may reach :443.
+  # Sourced from roles/pm/defaults/main.yml; refresh periodically.
+  set cloudflare4 {
+    type ipv4_addr
+    flags interval
+    elements = {
+{% for cidr in cloudflare_ipv4_ranges | default([]) %}
+      {{ cidr }}{% if not loop.last %},{% endif %}
+
+{% endfor %}
+    }
+  }
+
+  # Cloudflare origin-pull IPv6 ranges (T42)
+  set cloudflare6 {
+    type ipv6_addr
+    flags interval
+    elements = {
+{% for cidr in cloudflare_ipv6_ranges | default([]) %}
+      {{ cidr }}{% if not loop.last %},{% endif %}
+
+{% endfor %}
+    }
+  }
+{% endif %}
 
   chain input {
     type filter hook input priority 0; policy drop;
@@ -33,6 +61,15 @@ table inet filter {
     tcp dport 22 ct state new add @ssh_brute6 { ip6 saddr limit rate over 15/minute burst 30 packets } drop
 
     tcp dport 22 accept
+
+{% if pm_nftables_cloudflare_only | default(true) %}
+    # T42: accept HTTPS only from Cloudflare (Full-strict — no direct :443 access)
+    tcp dport 443 ip saddr @cloudflare4 accept
+    tcp dport 443 ip6 saddr @cloudflare6 accept
+{% else %}
+    # T42: accept HTTPS from any source (pm_nftables_cloudflare_only=false)
+    tcp dport 443 accept
+{% endif %}
   }
 
   chain forward {

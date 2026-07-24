@@ -1,0 +1,224 @@
+---
+# --------------------------------------------------------------------------
+# T39 — roles/pm — base
+# Creates the pm system user + rootless Docker, directory layout, sysctl
+# tweak, builds the compose images, and brings the stack up via a systemd
+# user unit (pm-compose.service) under the pm user.
+# --------------------------------------------------------------------------
+
+# ── 1. pm group and user ─────────────────────────────────────────────────
+
+- name: Create pm group
+  group:
+    name: "{{ pm_group }}"
+    system: true
+    state: present
+
+- name: Create pm system user
+  user:
+    name: "{{ pm_user }}"
+    group: "{{ pm_group }}"
+    # pm containers need the pm group; no interactive shell needed.
+    shell: /usr/sbin/nologin
+    system: true
+    create_home: true
+    home: /home/pm
+    state: present
+
+- name: Read passwd entry for pm user
+  getent:
+    database: passwd
+    key: "{{ pm_user }}"
+
+- name: Cache pm user UID
+  set_fact:
+    pm_user_uid: "{{ ansible_facts.getent_passwd[pm_user][1] }}"
+
+# ── 2. subuid / subgid for rootless Docker ───────────────────────────────
+
+- name: Allocate subuid range for pm user
+  lineinfile:
+    path: /etc/subuid
+    line: "{{ pm_user }}:100000:65536"
+    create: true
+
+- name: Allocate subgid range for pm user
+  lineinfile:
+    path: /etc/subgid
+    line: "{{ pm_user }}:100000:65536"
+    create: true
+
+# ── 3. Required packages ─────────────────────────────────────────────────
+
+- name: Install rootless Docker prerequisites
+  apt:
+    name:
+      - uidmap
+      - dbus-user-session
+      - curl
+      - acl          # needed for become_user with nologin shell
+    state: present
+
+# ── 4. sysctl: allow binding to port 80+ without root ────────────────────
+#    nginx inside the stack listens on :443; rootless Docker cannot bind
+#    privileged ports by default.
+
+- name: Set net.ipv4.ip_unprivileged_port_start
+  sysctl:
+    name: net.ipv4.ip_unprivileged_port_start
+    value: "{{ pm_sysctl_unprivileged_port_start }}"
+    sysctl_set: true
+    state: present
+    reload: true
+
+# ── 5. /srv/pm directory tree ────────────────────────────────────────────
+
+- name: Create /srv/pm directory tree
+  file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner | default(pm_user) }}"
+    group: "{{ item.group | default(pm_group) }}"
+    mode: "{{ item.mode | default('0750') }}"
+  loop:
+    - { path: /srv/pm }
+    - { path: /srv/pm/runners }
+    - { path: /srv/pm/data }
+    - { path: /srv/pm/data/runs }
+    # projectctl.sock lives here; owned root:pm so the pm container can connect
+    - { path: /srv/pm, owner: root, group: "{{ pm_group }}", mode: "0750" }
+
+# ── 6. Deploy app source ─────────────────────────────────────────────────
+
+- name: Create pm app destination directory
+  file:
+    path: "{{ pm_app_dest }}"
+    state: directory
+    owner: "{{ pm_user }}"
+    group: "{{ pm_group }}"
+    mode: "0750"
+
+- name: Synchronise app/ source to {{ pm_app_dest }}
+  synchronize:
+    src: "{{ pm_app_src }}/"
+    dest: "{{ pm_app_dest }}/"
+    rsync_opts:
+      - "--exclude=node_modules"
+      - "--exclude=.git"
+      - "--exclude=*/dist"
+    delete: false
+  notify: restart pm compose
+
+# ── 7. Enable linger so pm user services survive without a login session ──
+
+- name: Enable linger for pm user
+  command: loginctl enable-linger {{ pm_user }}
+  changed_when: false
+
+# ── 8. Rootless Docker for pm user ───────────────────────────────────────
+
+- name: Download Docker rootless install script
+  get_url:
+    url: https://get.docker.com/rootless
+    dest: /tmp/rootless-install-pm.sh
+    mode: "0755"
+
+- name: Run Docker rootless install for pm user
+  become: true
+  become_user: "{{ pm_user }}"
+  shell: /tmp/rootless-install-pm.sh
+  args:
+    creates: "/home/{{ pm_user }}/bin/dockerd-rootless.sh"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ pm_user_uid }}"
+    HOME: "/home/{{ pm_user }}"
+
+- name: Ensure Docker CLI plugin directory exists for pm user
+  become: true
+  become_user: "{{ pm_user }}"
+  file:
+    path: "/home/{{ pm_user }}/.docker/cli-plugins"
+    state: directory
+    owner: "{{ pm_user }}"
+    group: "{{ pm_group }}"
+    mode: "0755"
+
+- name: Install Docker Compose CLI plugin for pm user
+  become: true
+  become_user: "{{ pm_user }}"
+  get_url:
+    url: "https://github.com/docker/compose/releases/download/{{ docker_compose_version }}/docker-compose-linux-{{ docker_compose_arch_map.get(ansible_facts['architecture'], ansible_facts['architecture']) }}"
+    dest: "/home/{{ pm_user }}/.docker/cli-plugins/docker-compose"
+    mode: "0755"
+
+- name: Enable and start rootless Docker user service for pm user
+  become: true
+  become_user: "{{ pm_user }}"
+  systemd:
+    name: docker
+    scope: user
+    state: started
+    enabled: true
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ pm_user_uid }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ pm_user_uid }}/bus"
+
+- name: Load nf_tables kernel module for rootless Docker
+  modprobe:
+    name: nf_tables
+    state: present
+
+# ── 9. Build compose images ──────────────────────────────────────────────
+
+- name: Build pm compose images
+  become: true
+  become_user: "{{ pm_user }}"
+  command:
+    cmd: >
+      /home/{{ pm_user }}/bin/docker compose
+      --project-name {{ pm_compose_project }}
+      --file {{ pm_app_dest }}/compose.yaml
+      build
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ pm_user_uid }}"
+    DOCKER_HOST: "unix:///run/user/{{ pm_user_uid }}/docker.sock"
+    HOME: "/home/{{ pm_user }}"
+    PATH: "/home/{{ pm_user }}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  register: pm_compose_build
+  changed_when: "'CACHED' not in pm_compose_build.stdout"
+
+# ── 10. pm-compose systemd user unit ─────────────────────────────────────
+
+- name: Ensure systemd user unit directory exists for pm user
+  file:
+    path: "/home/{{ pm_user }}/.config/systemd/user"
+    state: directory
+    owner: "{{ pm_user }}"
+    group: "{{ pm_group }}"
+    mode: "0755"
+
+- name: Deploy pm-compose.service systemd user unit
+  template:
+    src: pm-compose.service.j2
+    dest: "/home/{{ pm_user }}/.config/systemd/user/pm-compose.service"
+    owner: "{{ pm_user }}"
+    group: "{{ pm_group }}"
+    mode: "0644"
+  notify:
+    - reload systemd daemon
+    - restart pm compose
+
+- name: Flush handlers to reload daemon before enabling unit
+  meta: flush_handlers
+
+- name: Enable and start pm-compose.service for pm user
+  become: true
+  become_user: "{{ pm_user }}"
+  systemd:
+    name: pm-compose.service
+    scope: user
+    state: started
+    enabled: true
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ pm_user_uid }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ pm_user_uid }}/bus"
