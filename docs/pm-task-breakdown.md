@@ -93,7 +93,7 @@ Dependencies use task IDs. "—" means none beyond the repo scaffold.
 | T39 | **`roles/pm` — base** — create `pm` user + rootless dockerd (generalize `docker_rootless.yml`), `pm` group, `/srv/pm/{runners,...}`, sysctl `ip_unprivileged_port_start=80`, build images, bring the compose stack up via a systemd user unit. Done: playbook run leaves the pm stack listening. | L | T02 |
 | T40 | **`roles/pm` — nginx + TLS + auth** — render nginx conf, self-signed origin cert into a volume, htpasswd from vaulted `pm_auth_password`; document Cloudflare Full(strict). Done: origin serves TLS + basic auth ready for Cloudflare. | S | T39 |
 | T41 | **`roles/pm` — pm-projectctl install** — deploy the helper + its systemd unit and socket permissions; no provider creds in Ansible. Done: `create/start/stop/delete` reachable from the pm container after a playbook run. | S | T39, T08 |
-| T42 | **`roles/nftables` — 80/443** — add accept rules, optionally scoped to Cloudflare IP ranges. Done: origin reachable only as intended. | S | — |
+| T42 | **`roles/nftables` — 443** — add the accept rule (no port 80 — Cloudflare Full-strict always connects over HTTPS), optionally scoped to Cloudflare IP ranges. Done: origin reachable only as intended. | S | — |
 | T43 | **End-to-end smoke + runbook** — on the VPS: add a project from the UI, run implement→verify on a tiny sample repo, confirm branch + artifacts; write `docs/pm-runbook.md`. Done: documented green path start to finish. | M | T39–T42, T27 |
 
 ---
