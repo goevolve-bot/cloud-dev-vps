@@ -1,0 +1,1365 @@
+#!/usr/bin/env python3
+"""pm-projectctl — the PM system's single root-touching interface.
+
+The pm web app runs unprivileged (user ``pm``) and holds no project docker
+socket and no project secret. Everything that needs root — creating a project's
+OS user, wiring up its rootless docker daemon, minting its deploy key —
+happens here, behind a strictly validated verb set reachable over a unix socket
+owned by ``root:pm`` (mode 0660). See docs/pm-system-plan.md.
+
+Deliberately dependency-free (Python 3.9+ stdlib only): this runs as root, so
+it must stay small enough to audit in one sitting and must not carry a package
+tree of its own.
+
+Protocol (both directions newline-delimited JSON, one request per connection):
+
+    -> {"verb": "create", "args": {"name": "demo", "gitUrl": "git@..."}}
+    <- {"type": "progress", "step": "user",  "message": "..."}
+    <- {"type": "progress", "step": "clone", "message": "..."}
+    <- {"type": "result", "ok": true, "data": {...}}          (or "error")
+
+Command injection is structurally impossible here: every external command is
+``execve``'d with an argv array (never a shell string), and ``git clone`` puts
+``--`` before the URL so a ``-``-prefixed URL cannot be read as a flag.
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import grp
+import json
+import os
+import pwd
+import re
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+import traceback
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+
+CONFIG_PATH = os.environ.get("PM_PROJECTCTL_CONFIG", "/etc/pm-projectctl.conf")
+
+DEFAULT_CONFIG: Dict[str, Any] = {
+    # Control socket pm talks to (mounted into the pm container).
+    "socket_path": "/srv/pm/projectctl.sock",
+    # One directory per project; the project's runner binds its control socket
+    # inside its own directory (see runner_socket_path() for why not a flat file).
+    "runners_dir": "/srv/pm/runners",
+    # Project metadata written by create, read by status (root-owned, pm-readable).
+    "state_dir": "/srv/pm/projects",
+    # Group shared with the pm app — grants traversal into a project's work tree
+    # and connect access to its runner socket. Project users are NEVER in it.
+    "pm_group": "pm",
+    "user_prefix": "pm-",
+    # argv of the per-project runner (@pm/runner, deployed by roles/pm).
+    "runner_exec": ["/usr/bin/node", "/srv/pm/app/runner/dist/index.js"],
+    # Clone lives at ~/<work_subdir>/<repo>; group-readable by pm for `.pm/`.
+    "work_subdir": "work",
+    "subid_count": 65536,
+    "subid_min": 100000,
+    "git_user_name": "pm",
+    "git_user_email": "pm@localhost",
+    "wait_timeout": 60,
+}
+
+SD_LISTEN_FDS_START = 3
+MAX_REQUEST_BYTES = 64 * 1024
+
+BASE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Tools every verb needs, plus the extra ones only `create` needs.
+CORE_TOOLS = ["systemctl", "loginctl"]
+CREATE_TOOLS = [
+    "useradd",
+    "usermod",
+    "ssh-keygen",
+    "git",
+    "newuidmap",
+    "newgidmap",
+    "dockerd-rootless-setuptool.sh",
+]
+
+# `.pm/` skeleton — the repo-stored task board (docs/pm-system-plan.md). T05's
+# model library owns the richer read/write side; create only needs the tree to
+# exist so the first task has somewhere to land.
+PM_SCAFFOLD_DIRS = [
+    "tasks/todo",
+    "tasks/in-progress",
+    "tasks/ready-for-review",
+    "tasks/done",
+    "tasks/blocked",
+    "specs",
+    "adrs",
+]
+
+PM_SCAFFOLD_README = """# .pm/
+
+Task board, specs and decision records for this project, versioned with the
+code and readable without the PM system.
+
+- `tasks/<status>/NNNN-slug/` — one folder per task. Status is the folder:
+  `todo`, `in-progress`, `ready-for-review`, `done`, `blocked`. Moving a task
+  is a `git mv`.
+  - `index.md` — front matter (id, created, branch) + description
+  - `comments/NNNN.md`, `runs/NNNN.md` — markdown with YAML front matter
+  - `attachments/` — pasted images, text snippets, uploads
+- `specs/` — living "actual state" docs, one markdown file per area.
+- `adrs/` — `NNNN-title.md`, front matter `status: accepted | superseded-by:
+  NNNN | abandoned`.
+
+Written on the default branch only; task branches never touch `.pm/`.
+"""
+
+
+class Config:
+    """Runtime configuration: defaults overlaid with /etc/pm-projectctl.conf."""
+
+    def __init__(self, values: Dict[str, Any]):
+        self.socket_path: str = values["socket_path"]
+        self.runners_dir: str = values["runners_dir"]
+        self.state_dir: str = values["state_dir"]
+        self.pm_group: str = values["pm_group"]
+        self.user_prefix: str = values["user_prefix"]
+        self.runner_exec: List[str] = list(values["runner_exec"])
+        self.work_subdir: str = values["work_subdir"]
+        self.subid_count: int = int(values["subid_count"])
+        self.subid_min: int = int(values["subid_min"])
+        self.git_user_name: str = values["git_user_name"]
+        self.git_user_email: str = values["git_user_email"]
+        self.wait_timeout: int = int(values["wait_timeout"])
+
+    def user_for(self, name: str) -> str:
+        return self.user_prefix + name
+
+
+def load_config(path: str = CONFIG_PATH) -> Config:
+    values = dict(DEFAULT_CONFIG)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            overrides = json.load(handle)
+    except FileNotFoundError:
+        overrides = {}
+    except (OSError, ValueError) as exc:
+        raise PmError("bad_config", "cannot read %s: %s" % (path, exc))
+    if not isinstance(overrides, dict):
+        raise PmError("bad_config", "%s must contain a JSON object" % path)
+    unknown = sorted(set(overrides) - set(DEFAULT_CONFIG))
+    if unknown:
+        raise PmError("bad_config", "unknown config keys: %s" % ", ".join(unknown))
+    if "runner_exec" in overrides:
+        exec_argv = overrides["runner_exec"]
+        if not isinstance(exec_argv, list) or not exec_argv:
+            raise PmError("bad_config", "runner_exec must be a non-empty array")
+        if not all(isinstance(item, str) for item in exec_argv):
+            raise PmError("bad_config", "runner_exec must contain only strings")
+    values.update(overrides)
+    return Config(values)
+
+
+# --------------------------------------------------------------------------
+# Errors, logging
+# --------------------------------------------------------------------------
+
+
+class PmError(Exception):
+    """An error with a stable machine-readable code for the API layer."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def log(message: str) -> None:
+    print("pm-projectctl: %s" % message, file=sys.stderr, flush=True)
+
+
+# --------------------------------------------------------------------------
+# Validation
+# --------------------------------------------------------------------------
+
+# Usernames must stay <= 32 chars; `pm-` + 29 fits with room to spare. No
+# leading/trailing dash keeps the name usable as a DNS-ish label too.
+NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,27}[a-z0-9])?$")
+
+# scp-like syntax: user@host:path — the only form without an explicit scheme.
+SCP_URL_RE = re.compile(r"^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[^\s]+$")
+ALLOWED_URL_SCHEMES = ("https://", "ssh://")
+
+REPO_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def validate_project_name(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        raise PmError("invalid_name", "project name is required")
+    if not NAME_RE.match(value):
+        raise PmError(
+            "invalid_name",
+            "project name must match [a-z0-9-], start and end alphanumeric, "
+            "max 29 chars (got %r)" % value,
+        )
+    return value
+
+
+def validate_git_url(value: Any) -> str:
+    """Allow-list the URL before it is ever handed to git.
+
+    argv execution already makes shell metacharacters inert; this rejects the
+    transports that are dangerous regardless of quoting (``ext::`` runs an
+    arbitrary command, ``file://`` reaches the host filesystem).
+    """
+    if not isinstance(value, str) or not value:
+        raise PmError("invalid_url", "git URL is required")
+    if len(value) > 512:
+        raise PmError("invalid_url", "git URL is too long")
+    if any(ch.isspace() or ord(ch) < 0x20 for ch in value):
+        raise PmError("invalid_url", "git URL contains whitespace or control characters")
+    if value.startswith("-"):
+        raise PmError("invalid_url", "git URL must not start with '-'")
+    if value.startswith(ALLOWED_URL_SCHEMES) or SCP_URL_RE.match(value):
+        return value
+    raise PmError(
+        "invalid_url",
+        "git URL must be https://, ssh:// or user@host:path (got %r)" % value,
+    )
+
+
+def repo_dir_name(url: str) -> str:
+    """Directory name for the clone, derived from the URL's repository path.
+
+    The host part is stripped first, so a URL that carries no path at all
+    (``https://example.com/``) is an error rather than a directory named after
+    the host.
+    """
+    rest = url
+    for scheme in ALLOWED_URL_SCHEMES:
+        if rest.startswith(scheme):
+            rest = rest[len(scheme) :]
+            if "/" not in rest:
+                raise PmError("invalid_url", "git URL %r has no repository path" % url)
+            rest = rest.split("/", 1)[1]
+            break
+    else:  # scp-like user@host:path
+        if ":" in rest:
+            rest = rest.split(":", 1)[1]
+    tail = rest.rstrip("/").rsplit("/", 1)[-1]
+    if tail.endswith(".git"):
+        tail = tail[: -len(".git")]
+    if not REPO_NAME_RE.match(tail):
+        raise PmError("invalid_url", "cannot derive a repository name from %r" % url)
+    return tail
+
+
+# --------------------------------------------------------------------------
+# Process execution — argv only, never a shell string
+# --------------------------------------------------------------------------
+
+
+class CommandError(PmError):
+    def __init__(self, argv: Sequence[str], result: "subprocess.CompletedProcess[str]"):
+        detail = (result.stderr or result.stdout or "").strip()
+        if len(detail) > 2000:
+            detail = detail[:2000] + " …"
+        super().__init__(
+            "command_failed",
+            "%s exited %d%s" % (argv[0], result.returncode, ": " + detail if detail else ""),
+        )
+        self.argv = list(argv)
+        self.result = result
+
+
+def run(
+    argv: Sequence[str],
+    *,
+    check: bool = True,
+    env: Optional[Dict[str, str]] = None,
+    cwd: Optional[str] = None,
+    timeout: Optional[int] = 600,
+    as_user: Optional["pwd.struct_passwd"] = None,
+) -> "subprocess.CompletedProcess[str]":
+    """Run a command, optionally dropping to a project user.
+
+    ``shell=False`` always. When ``as_user`` is given the child also gets that
+    user's group and *only* that group — never root's supplementary groups.
+    """
+    kwargs: Dict[str, Any] = {}
+    if as_user is not None:
+        kwargs["user"] = as_user.pw_uid
+        kwargs["group"] = as_user.pw_gid
+        kwargs["extra_groups"] = [as_user.pw_gid]
+    try:
+        result = subprocess.run(
+            list(argv),
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=cwd,
+            timeout=timeout,
+            **kwargs,
+        )
+    except FileNotFoundError:
+        raise PmError("missing_dependency", "%s is not installed" % argv[0])
+    except subprocess.TimeoutExpired:
+        raise PmError("timeout", "%s timed out after %ss" % (argv[0], timeout))
+    if check and result.returncode != 0:
+        raise CommandError(argv, result)
+    return result
+
+
+def user_env(pw: "pwd.struct_passwd", extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Environment for commands run as a project user.
+
+    The rootless daemon lives entirely in the user's session: its systemd
+    manager is reached through XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS, its
+    socket through DOCKER_HOST.
+    """
+    runtime_dir = "/run/user/%d" % pw.pw_uid
+    env = {
+        "HOME": pw.pw_dir,
+        "USER": pw.pw_name,
+        "LOGNAME": pw.pw_name,
+        "SHELL": "/bin/sh",
+        "PATH": "%s/bin:%s/.local/bin:%s" % (pw.pw_dir, pw.pw_dir, BASE_PATH),
+        "XDG_RUNTIME_DIR": runtime_dir,
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=%s/bus" % runtime_dir,
+        "DOCKER_HOST": "unix://%s/docker.sock" % runtime_dir,
+    }
+    if extra:
+        env.update(extra)
+    return env
+
+
+def user_systemctl(
+    user: str, args: Sequence[str], *, check: bool = True, timeout: int = 120
+) -> "subprocess.CompletedProcess[str]":
+    """Drive a project user's systemd manager from root.
+
+    ``--machine=<user>@.host`` proxies to that user's manager over D-Bus, so
+    root never needs a shell in the project account.
+    """
+    return run(
+        ["systemctl", "--machine", "%s@.host" % user, "--user", *args],
+        check=check,
+        timeout=timeout,
+    )
+
+
+def wait_for(predicate: Callable[[], bool], timeout: int, interval: float = 0.5) -> bool:
+    deadline = time.monotonic() + timeout
+    while True:
+        if predicate():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
+
+
+# --------------------------------------------------------------------------
+# Filesystem helpers
+# --------------------------------------------------------------------------
+
+
+def ensure_dir(path: str, mode: int, uid: int = 0, gid: int = 0) -> None:
+    if not os.path.isdir(path):
+        os.makedirs(path, exist_ok=True)
+    os.chown(path, uid, gid)
+    os.chmod(path, mode)
+
+
+def write_file(path: str, content: str, mode: int, uid: int = 0, gid: int = 0) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    os.chown(tmp, uid, gid)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def chown_tree(path: str, uid: int, gid: int) -> None:
+    os.chown(path, uid, gid)
+    for root, dirs, files in os.walk(path):
+        for entry in dirs + files:
+            target = os.path.join(root, entry)
+            if not os.path.islink(target):
+                os.chown(target, uid, gid)
+
+
+def pm_gid(cfg: Config) -> int:
+    try:
+        return grp.getgrnam(cfg.pm_group).gr_gid
+    except KeyError:
+        raise PmError("missing_group", "group %r does not exist" % cfg.pm_group)
+
+
+def project_lock(cfg: Config, name: str):
+    """Serialize verbs per project so two creates cannot race."""
+    lock_dir = os.path.join(cfg.state_dir, ".locks")
+    ensure_dir(cfg.state_dir, 0o750, 0, pm_gid(cfg))
+    ensure_dir(lock_dir, 0o700)
+    handle = open(os.path.join(lock_dir, "%s.lock" % name), "w")
+
+    class _Lock:
+        def __enter__(self):
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                handle.close()
+                raise PmError("busy", "another operation on %r is in progress" % name)
+            return self
+
+        def __exit__(self, *_exc):
+            fcntl.flock(handle, fcntl.LOCK_UN)
+            handle.close()
+            return False
+
+    return _Lock()
+
+
+# --------------------------------------------------------------------------
+# Project state file
+# --------------------------------------------------------------------------
+
+
+def state_path(cfg: Config, name: str) -> str:
+    return os.path.join(cfg.state_dir, "%s.json" % name)
+
+
+def read_state(cfg: Config, name: str) -> Optional[Dict[str, Any]]:
+    try:
+        with open(state_path(cfg, name), "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def write_state(cfg: Config, name: str, values: Dict[str, Any]) -> None:
+    ensure_dir(cfg.state_dir, 0o750, 0, pm_gid(cfg))
+    existing = read_state(cfg, name) or {}
+    existing.update(values)
+    existing["name"] = name
+    # 0640 root:pm — pm reads project metadata, project users never see it.
+    write_file(
+        state_path(cfg, name),
+        json.dumps(existing, indent=2, sort_keys=True) + "\n",
+        0o640,
+        0,
+        pm_gid(cfg),
+    )
+
+
+def list_project_names(cfg: Config) -> List[str]:
+    try:
+        entries = os.listdir(cfg.state_dir)
+    except FileNotFoundError:
+        return []
+    names = []
+    for entry in entries:
+        if entry.endswith(".json"):
+            candidate = entry[: -len(".json")]
+            if NAME_RE.match(candidate):
+                names.append(candidate)
+    return sorted(names)
+
+
+# --------------------------------------------------------------------------
+# Preflight
+# --------------------------------------------------------------------------
+
+
+def require_root() -> None:
+    if os.geteuid() != 0:
+        raise PmError("not_root", "pm-projectctl must run as root")
+
+
+def preflight(cfg: Config, tools: Sequence[str]) -> None:
+    require_root()
+    pm_gid(cfg)
+    missing = [tool for tool in tools if shutil.which(tool) is None]
+    if missing:
+        raise PmError(
+            "missing_dependency",
+            "missing host tools: %s (roles/pm installs these)" % ", ".join(missing),
+        )
+
+
+# --------------------------------------------------------------------------
+# create — user, subids, home layout
+# --------------------------------------------------------------------------
+
+
+def ensure_user(cfg: Config, name: str) -> "pwd.struct_passwd":
+    user = cfg.user_for(name)
+    try:
+        return pwd.getpwnam(user)
+    except KeyError:
+        pass
+    run(
+        [
+            "useradd",
+            "--create-home",
+            "--shell",
+            "/usr/sbin/nologin",
+            "--comment",
+            "pm project %s" % name,
+            user,
+        ]
+    )
+    try:
+        return pwd.getpwnam(user)
+    except KeyError:
+        raise PmError("user_failed", "user %s was not created" % user)
+
+
+def parse_subid_file(text: str) -> List[Tuple[str, int, int]]:
+    entries = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(":")
+        if len(parts) != 3:
+            continue
+        try:
+            entries.append((parts[0], int(parts[1]), int(parts[2])))
+        except ValueError:
+            continue
+    return entries
+
+
+def next_subid_start(files_text: Sequence[str], subid_min: int, count: int) -> int:
+    """First free range start above every existing allocation, aligned to count."""
+    highest = subid_min
+    for text in files_text:
+        for _name, start, size in parse_subid_file(text):
+            highest = max(highest, start + size)
+    # Align upwards so ranges stay tidy and non-overlapping.
+    remainder = (highest - subid_min) % count
+    if remainder:
+        highest += count - remainder
+    return highest
+
+
+def _read_optional(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return ""
+
+
+def ensure_subids(cfg: Config, user: str) -> Dict[str, Any]:
+    """Give the user subordinate id ranges — rootless docker needs them.
+
+    Debian's useradd usually allocates these already; this fills the gap when
+    it does not, without ever handing out an overlapping range.
+    """
+    subuid_text = _read_optional("/etc/subuid")
+    subgid_text = _read_optional("/etc/subgid")
+    has_uid = any(entry[0] == user for entry in parse_subid_file(subuid_text))
+    has_gid = any(entry[0] == user for entry in parse_subid_file(subgid_text))
+    if has_uid and has_gid:
+        return {"allocated": False}
+    start = next_subid_start([subuid_text, subgid_text], cfg.subid_min, cfg.subid_count)
+    span = "%d-%d" % (start, start + cfg.subid_count - 1)
+    argv = ["usermod"]
+    if not has_uid:
+        argv += ["--add-subuids", span]
+    if not has_gid:
+        argv += ["--add-subgids", span]
+    argv.append(user)
+    run(argv)
+    return {"allocated": True, "range": span}
+
+
+def ensure_home_layout(cfg: Config, pw: "pwd.struct_passwd") -> None:
+    """Lay out the project home so pm can read `.pm/` but never the secrets.
+
+    home        0710 user:pm   — pm may traverse, not enumerate
+      work/     2750 user:pm   — pm reads the clone (setgid keeps new files in pm)
+      .ssh/     0700 user:user — deploy key, invisible to pm
+      .pm-creds 0700 user:user — provider tokens (T09), invisible to pm
+    """
+    gid = pm_gid(cfg)
+    ensure_dir(pw.pw_dir, 0o710, pw.pw_uid, gid)
+    ensure_dir(os.path.join(pw.pw_dir, ".ssh"), 0o700, pw.pw_uid, pw.pw_gid)
+    ensure_dir(os.path.join(pw.pw_dir, ".pm-creds"), 0o700, pw.pw_uid, pw.pw_gid)
+    ensure_dir(os.path.join(pw.pw_dir, cfg.work_subdir), 0o2750, pw.pw_uid, gid)
+    ensure_dir(os.path.join(pw.pw_dir, ".config"), 0o700, pw.pw_uid, pw.pw_gid)
+    ensure_dir(os.path.join(pw.pw_dir, ".config", "systemd"), 0o700, pw.pw_uid, pw.pw_gid)
+    ensure_dir(
+        os.path.join(pw.pw_dir, ".config", "systemd", "user"), 0o700, pw.pw_uid, pw.pw_gid
+    )
+
+
+def runner_dir_path(cfg: Config, name: str) -> str:
+    return os.path.join(cfg.runners_dir, name)
+
+
+def runner_socket_path(cfg: Config, name: str) -> str:
+    """Per-project directory rather than a flat ``<name>.sock``.
+
+    A flat file would need the project users to share write access to one
+    directory, which also makes every runner socket reachable by every other
+    project — exactly the boundary the OS-user split exists to draw. A
+    ``<name>/`` directory owned ``pm-<name>:pm`` mode 2750 lets the runner bind
+    inside it, lets pm connect, and lets no one else even traverse.
+    """
+    return os.path.join(runner_dir_path(cfg, name), "control.sock")
+
+
+def ensure_runner_dir(cfg: Config, name: str, pw: "pwd.struct_passwd") -> str:
+    gid = pm_gid(cfg)
+    ensure_dir(cfg.runners_dir, 0o755, 0, gid)
+    path = runner_dir_path(cfg, name)
+    ensure_dir(path, 0o2750, pw.pw_uid, gid)
+    return path
+
+
+def ensure_linger(cfg: Config, pw: "pwd.struct_passwd") -> None:
+    """Linger keeps the user manager (and thus the daemon) alive without a login."""
+    run(["loginctl", "enable-linger", pw.pw_name])
+    if not wait_for(lambda: os.path.isdir("/run/user/%d" % pw.pw_uid), cfg.wait_timeout):
+        raise PmError(
+            "linger_failed",
+            "/run/user/%d did not appear after enabling linger for %s"
+            % (pw.pw_uid, pw.pw_name),
+        )
+
+
+# --------------------------------------------------------------------------
+# create — rootless docker
+# --------------------------------------------------------------------------
+
+
+def docker_socket_path(pw: "pwd.struct_passwd") -> str:
+    return "/run/user/%d/docker.sock" % pw.pw_uid
+
+
+def ensure_rootless_docker(cfg: Config, pw: "pwd.struct_passwd") -> Dict[str, Any]:
+    unit = os.path.join(pw.pw_dir, ".config", "systemd", "user", "docker.service")
+    installed = os.path.exists(unit)
+    if not installed:
+        setuptool = shutil.which("dockerd-rootless-setuptool.sh")
+        if setuptool is None:
+            raise PmError(
+                "missing_dependency",
+                "dockerd-rootless-setuptool.sh is not installed "
+                "(docker-ce-rootless-extras)",
+            )
+        run(
+            [setuptool, "install", "--force"],
+            env=user_env(pw),
+            as_user=pw,
+            timeout=600,
+        )
+    user_systemctl(pw.pw_name, ["daemon-reload"])
+    user_systemctl(pw.pw_name, ["enable", "--now", "docker"])
+    socket_file = docker_socket_path(pw)
+    if not wait_for(lambda: os.path.exists(socket_file), cfg.wait_timeout):
+        raise PmError("docker_failed", "rootless docker socket %s never appeared" % socket_file)
+    return {"installed": not installed, "socket": socket_file}
+
+
+# --------------------------------------------------------------------------
+# create — deploy key
+# --------------------------------------------------------------------------
+
+
+def deploy_key_path(pw: "pwd.struct_passwd") -> str:
+    return os.path.join(pw.pw_dir, ".ssh", "deploy_key")
+
+
+def ssh_config_text(key_path: str) -> str:
+    return (
+        "# Managed by pm-projectctl. This account has exactly one repository,\n"
+        "# so the deploy key applies to every host it talks to.\n"
+        "Host *\n"
+        "  IdentityFile %s\n"
+        "  IdentitiesOnly yes\n"
+        "  StrictHostKeyChecking accept-new\n"
+        "  BatchMode yes\n" % key_path
+    )
+
+
+def ensure_deploy_key(cfg: Config, name: str, pw: "pwd.struct_passwd") -> str:
+    key_path = deploy_key_path(pw)
+    if not os.path.exists(key_path):
+        run(
+            [
+                "ssh-keygen",
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-C",
+                "pm-%s deploy key" % name,
+                "-f",
+                key_path,
+            ],
+            env=user_env(pw),
+            as_user=pw,
+            timeout=60,
+        )
+    os.chmod(key_path, 0o600)
+    os.chown(key_path, pw.pw_uid, pw.pw_gid)
+    pub_path = key_path + ".pub"
+    os.chown(pub_path, pw.pw_uid, pw.pw_gid)
+    write_file(
+        os.path.join(pw.pw_dir, ".ssh", "config"),
+        ssh_config_text(key_path),
+        0o600,
+        pw.pw_uid,
+        pw.pw_gid,
+    )
+    with open(pub_path, "r", encoding="utf-8") as handle:
+        return handle.read().strip()
+
+
+# --------------------------------------------------------------------------
+# create — clone
+# --------------------------------------------------------------------------
+
+
+def git_ssh_command(key_path: str, known_hosts: str) -> str:
+    return (
+        "ssh -i '%s' -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new "
+        "-o UserKnownHostsFile='%s' -o BatchMode=yes" % (key_path, known_hosts)
+    )
+
+
+def clone_argv(url: str, dest: str) -> List[str]:
+    """``--`` keeps a ``-``-prefixed URL from being parsed as a git flag."""
+    return ["git", "clone", "--", url, dest]
+
+
+def git_env(pw: "pwd.struct_passwd") -> Dict[str, str]:
+    key_path = deploy_key_path(pw)
+    known_hosts = os.path.join(pw.pw_dir, ".ssh", "known_hosts")
+    return user_env(
+        pw,
+        {
+            "GIT_SSH_COMMAND": git_ssh_command(key_path, known_hosts),
+            # Never block on a credential prompt in an unattended service.
+            "GIT_TERMINAL_PROMPT": "0",
+        },
+    )
+
+
+# Deliberately matches git's generic "correct access rights ... repository
+# exists" trailer too: a deploy key that has not been added yet and a repo the
+# key cannot see are indistinguishable from the client, and both are resolved
+# the same way — authorize the key, call create again. A plain "permission
+# denied" without the publickey qualifier is a local filesystem error, not this.
+AUTH_FAIL_RE = re.compile(
+    r"permission denied \(|authentication failed|could not read username|"
+    r"repository not found|access denied|"
+    r"please make sure you have the correct access rights",
+    re.IGNORECASE,
+)
+
+
+def is_auth_failure(output: str) -> bool:
+    return bool(AUTH_FAIL_RE.search(output or ""))
+
+
+def clone_repo(cfg: Config, pw: "pwd.struct_passwd", url: str) -> Tuple[str, Optional[str]]:
+    """Clone into ~/work/<repo>. Returns (path, failure_kind|None)."""
+    dest = os.path.join(pw.pw_dir, cfg.work_subdir, repo_dir_name(url))
+    if os.path.isdir(os.path.join(dest, ".git")):
+        return dest, None
+    result = run(
+        clone_argv(url, dest),
+        check=False,
+        env=git_env(pw),
+        as_user=pw,
+        cwd=os.path.join(pw.pw_dir, cfg.work_subdir),
+        timeout=900,
+    )
+    if result.returncode != 0:
+        # Leave nothing half-cloned behind, so a retry starts clean.
+        if os.path.isdir(dest):
+            shutil.rmtree(dest, ignore_errors=True)
+        output = (result.stderr or "") + (result.stdout or "")
+        if is_auth_failure(output):
+            return dest, "awaiting-key"
+        raise CommandError(clone_argv(url, dest), result)
+    return dest, None
+
+
+# --------------------------------------------------------------------------
+# create — .pm/ scaffold
+# --------------------------------------------------------------------------
+
+
+def scaffold_pm_tree(cfg: Config, pw: "pwd.struct_passwd", repo_dir: str) -> Dict[str, Any]:
+    """Create `.pm/` and commit it on the default branch if the repo lacks one.
+
+    An empty repo is a first-class starting point (docs/pm-system-plan.md), so
+    this is the moment the board comes into existence.
+    """
+    pm_dir = os.path.join(repo_dir, ".pm")
+    if os.path.exists(pm_dir):
+        return {"scaffolded": False, "pushed": False}
+    for rel in PM_SCAFFOLD_DIRS:
+        path = os.path.join(pm_dir, rel)
+        os.makedirs(path, exist_ok=True)
+        with open(os.path.join(path, ".gitkeep"), "w", encoding="utf-8"):
+            pass
+    with open(os.path.join(pm_dir, "README.md"), "w", encoding="utf-8") as handle:
+        handle.write(PM_SCAFFOLD_README)
+    chown_tree(pm_dir, pw.pw_uid, pw.pw_gid)
+
+    env = git_env(pw)
+    for key, value in (("user.name", cfg.git_user_name), ("user.email", cfg.git_user_email)):
+        run(["git", "config", key, value], env=env, as_user=pw, cwd=repo_dir)
+    run(["git", "add", "--", ".pm"], env=env, as_user=pw, cwd=repo_dir)
+    run(
+        ["git", "commit", "-m", "pm: scaffold .pm/"],
+        env=env,
+        as_user=pw,
+        cwd=repo_dir,
+    )
+    # Pushing needs the remote to accept the deploy key; a fresh project whose
+    # key is not authorized yet still gets a valid local board, so a failure
+    # here is reported, not fatal.
+    push = run(
+        ["git", "push", "origin", "HEAD"],
+        check=False,
+        env=env,
+        as_user=pw,
+        cwd=repo_dir,
+        timeout=300,
+    )
+    if push.returncode != 0:
+        return {
+            "scaffolded": True,
+            "pushed": False,
+            "pushError": (push.stderr or push.stdout or "").strip()[:500],
+        }
+    return {"scaffolded": True, "pushed": True}
+
+
+# --------------------------------------------------------------------------
+# create — runner unit
+# --------------------------------------------------------------------------
+
+
+def render_runner_unit(
+    cfg: Config, name: str, pw: "pwd.struct_passwd", repo_dir: str
+) -> str:
+    exec_start = " ".join(cfg.runner_exec)
+    return "\n".join(
+        [
+            "# Managed by pm-projectctl — do not edit.",
+            "[Unit]",
+            "Description=pm runner for project %s" % name,
+            "After=docker.service",
+            "Requires=docker.service",
+            "",
+            "[Service]",
+            "Type=simple",
+            "Environment=PM_PROJECT=%s" % name,
+            "Environment=PM_RUNNER_SOCKET=%s" % runner_socket_path(cfg, name),
+            "Environment=PM_REPO_DIR=%s" % repo_dir,
+            "Environment=PM_CREDS_DIR=%s" % os.path.join(pw.pw_dir, ".pm-creds"),
+            "Environment=PM_DEPLOY_KEY=%s" % deploy_key_path(pw),
+            "Environment=DOCKER_HOST=unix://%s" % docker_socket_path(pw),
+            "ExecStart=%s" % exec_start,
+            "Restart=on-failure",
+            "RestartSec=2",
+            # 0007 + the setgid runners dir => socket is 0770 pm-<name>:pm, so
+            # pm can connect and no other project user can.
+            "UMask=0007",
+            "",
+            "[Install]",
+            "WantedBy=default.target",
+            "",
+        ]
+    )
+
+
+def install_runner(
+    cfg: Config, name: str, pw: "pwd.struct_passwd", repo_dir: str
+) -> Dict[str, Any]:
+    ensure_runner_dir(cfg, name, pw)
+    unit_path = os.path.join(pw.pw_dir, ".config", "systemd", "user", "runner.service")
+    write_file(
+        unit_path,
+        render_runner_unit(cfg, name, pw, repo_dir),
+        0o600,
+        pw.pw_uid,
+        pw.pw_gid,
+    )
+    user_systemctl(pw.pw_name, ["daemon-reload"])
+    if not os.path.exists(cfg.runner_exec[0]):
+        # The runner package is deployed separately (roles/pm); enable the unit
+        # so the project starts correctly once it lands, but do not fail here.
+        user_systemctl(pw.pw_name, ["enable", "runner"])
+        return {
+            "installed": True,
+            "started": False,
+            "warning": "runner executable %s not found — unit enabled but not started"
+            % cfg.runner_exec[0],
+        }
+    user_systemctl(pw.pw_name, ["enable", "--now", "runner"])
+    sock = runner_socket_path(cfg, name)
+    if not wait_for(lambda: os.path.exists(sock), cfg.wait_timeout):
+        return {
+            "installed": True,
+            "started": True,
+            "warning": "runner socket %s did not appear within %ss" % (sock, cfg.wait_timeout),
+        }
+    return {"installed": True, "started": True, "socket": sock}
+
+
+# --------------------------------------------------------------------------
+# Verbs
+# --------------------------------------------------------------------------
+
+Emit = Callable[[str, str], None]
+
+
+def verb_create(args: Dict[str, Any], cfg: Config, emit: Emit) -> Dict[str, Any]:
+    """Turn a git URL into a running project: user, daemon, key, clone, runner.
+
+    Idempotent and resumable: every step checks for its own result first, so a
+    second call after the deploy key has been authorized picks up at the clone.
+    """
+    name = validate_project_name(args.get("name"))
+    url = validate_git_url(args.get("gitUrl"))
+    preflight(cfg, CORE_TOOLS + CREATE_TOOLS)
+
+    with project_lock(cfg, name):
+        emit("user", "creating user %s" % cfg.user_for(name))
+        pw = ensure_user(cfg, name)
+        subids = ensure_subids(cfg, pw.pw_name)
+        emit("home", "laying out %s" % pw.pw_dir)
+        ensure_home_layout(cfg, pw)
+        ensure_runner_dir(cfg, name, pw)
+        previous = read_state(cfg, name) or {}
+        write_state(
+            cfg,
+            name,
+            {
+                "user": pw.pw_name,
+                "uid": pw.pw_uid,
+                "gitUrl": url,
+                "status": "provisioning",
+                "createdAt": previous.get("createdAt")
+                or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            },
+        )
+
+        emit("linger", "enabling linger for %s" % pw.pw_name)
+        ensure_linger(cfg, pw)
+
+        emit("docker", "setting up rootless docker")
+        docker = ensure_rootless_docker(cfg, pw)
+
+        emit("key", "generating deploy key")
+        public_key = ensure_deploy_key(cfg, name, pw)
+
+        emit("clone", "cloning %s" % url)
+        repo_dir, failure = clone_repo(cfg, pw, url)
+        if failure == "awaiting-key":
+            write_state(cfg, name, {"status": "awaiting-key", "repoDir": repo_dir})
+            emit("clone", "repository is not reachable with this deploy key yet")
+            return {
+                "status": "awaiting-key",
+                "name": name,
+                "user": pw.pw_name,
+                "gitUrl": url,
+                "publicKey": public_key,
+                "dockerSocket": docker["socket"],
+                "subids": subids,
+                "message": (
+                    "Add the deploy key to the repository (write access), then "
+                    "call create again to finish."
+                ),
+            }
+
+        emit("scaffold", "checking .pm/ tree")
+        scaffold = scaffold_pm_tree(cfg, pw, repo_dir)
+
+        emit("runner", "installing runner service")
+        runner = install_runner(cfg, name, pw, repo_dir)
+
+        write_state(
+            cfg,
+            name,
+            {
+                "status": "ready",
+                "repoDir": repo_dir,
+                "runnerSocket": runner_socket_path(cfg, name),
+                "dockerSocket": docker["socket"],
+            },
+        )
+        warnings = [
+            item
+            for item in (runner.get("warning"), scaffold.get("pushError"))
+            if item
+        ]
+        emit("done", "project %s is ready" % name)
+        return {
+            "status": "ready",
+            "name": name,
+            "user": pw.pw_name,
+            "uid": pw.pw_uid,
+            "gitUrl": url,
+            "repoDir": repo_dir,
+            "publicKey": public_key,
+            "dockerSocket": docker["socket"],
+            "runnerSocket": runner_socket_path(cfg, name),
+            "scaffolded": scaffold["scaffolded"],
+            "subids": subids,
+            "warnings": warnings,
+        }
+
+
+def _require_existing(cfg: Config, name: str) -> "pwd.struct_passwd":
+    try:
+        return pwd.getpwnam(cfg.user_for(name))
+    except KeyError:
+        raise PmError("unknown_project", "project %r does not exist" % name)
+
+
+def verb_start(args: Dict[str, Any], cfg: Config, emit: Emit) -> Dict[str, Any]:
+    name = validate_project_name(args.get("name"))
+    preflight(cfg, CORE_TOOLS)
+    pw = _require_existing(cfg, name)
+    with project_lock(cfg, name):
+        emit("docker", "starting rootless docker")
+        user_systemctl(pw.pw_name, ["start", "docker"])
+        emit("runner", "starting runner")
+        user_systemctl(pw.pw_name, ["start", "runner"])
+        sock = runner_socket_path(cfg, name)
+        ready = wait_for(lambda: os.path.exists(sock), cfg.wait_timeout)
+        write_state(cfg, name, {"lifecycle": "active"})
+        return {"name": name, "state": "active", "runnerSocket": sock, "socketReady": ready}
+
+
+def verb_stop(args: Dict[str, Any], cfg: Config, emit: Emit) -> Dict[str, Any]:
+    name = validate_project_name(args.get("name"))
+    preflight(cfg, CORE_TOOLS)
+    pw = _require_existing(cfg, name)
+    with project_lock(cfg, name):
+        emit("runner", "stopping runner")
+        user_systemctl(pw.pw_name, ["stop", "runner"], check=False)
+        emit("docker", "stopping rootless docker")
+        user_systemctl(pw.pw_name, ["stop", "docker"], check=False)
+        write_state(cfg, name, {"lifecycle": "stopped"})
+        return {"name": name, "state": "stopped"}
+
+
+def _unit_state(user: str, unit: str) -> str:
+    result = user_systemctl(user, ["is-active", unit], check=False, timeout=30)
+    return (result.stdout or result.stderr or "unknown").strip()
+
+
+def project_status(cfg: Config, name: str) -> Dict[str, Any]:
+    state = read_state(cfg, name) or {}
+    entry: Dict[str, Any] = {
+        "name": name,
+        "user": cfg.user_for(name),
+        "gitUrl": state.get("gitUrl"),
+        "repoDir": state.get("repoDir"),
+        "status": state.get("status", "unknown"),
+        "createdAt": state.get("createdAt"),
+        "runnerSocket": runner_socket_path(cfg, name),
+        "socketPresent": os.path.exists(runner_socket_path(cfg, name)),
+    }
+    try:
+        pw = pwd.getpwnam(entry["user"])
+    except KeyError:
+        entry["exists"] = False
+        entry["state"] = "missing"
+        return entry
+    entry["exists"] = True
+    entry["uid"] = pw.pw_uid
+    entry["docker"] = _unit_state(pw.pw_name, "docker")
+    entry["runner"] = _unit_state(pw.pw_name, "runner")
+    entry["state"] = "active" if entry["docker"] == "active" else "stopped"
+    return entry
+
+
+def verb_status(args: Dict[str, Any], cfg: Config, emit: Emit) -> Dict[str, Any]:
+    require_root()
+    name = args.get("name")
+    if name is not None:
+        validate_project_name(name)
+        return {"projects": [project_status(cfg, name)]}
+    return {"projects": [project_status(cfg, item) for item in list_project_names(cfg)]}
+
+
+VERBS: Dict[str, Callable[[Dict[str, Any], Config, Emit], Dict[str, Any]]] = {
+    "create": verb_create,
+    "start": verb_start,
+    "stop": verb_stop,
+    "status": verb_status,
+}
+
+
+# --------------------------------------------------------------------------
+# Request handling
+# --------------------------------------------------------------------------
+
+
+def handle_request(
+    cfg: Config,
+    raw: bytes,
+    write: Callable[[Dict[str, Any]], None],
+    verbs: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Parse one request and stream progress + a terminal result/error event."""
+    table = VERBS if verbs is None else verbs
+    try:
+        request = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        write({"type": "error", "code": "bad_request", "message": "invalid JSON: %s" % exc})
+        return
+    if not isinstance(request, dict):
+        write({"type": "error", "code": "bad_request", "message": "request must be an object"})
+        return
+    verb = request.get("verb")
+    handler = table.get(verb) if isinstance(verb, str) else None
+    if handler is None:
+        write(
+            {
+                "type": "error",
+                "code": "unknown_verb",
+                "message": "unknown verb %r (known: %s)" % (verb, ", ".join(sorted(table))),
+            }
+        )
+        return
+    args = request.get("args")
+    if args is None:
+        args = {}
+    if not isinstance(args, dict):
+        write({"type": "error", "code": "bad_request", "message": "args must be an object"})
+        return
+
+    def emit(step: str, message: str) -> None:
+        write({"type": "progress", "step": step, "message": message})
+
+    try:
+        data = handler(args, cfg, emit)
+        write({"type": "result", "ok": True, "data": data})
+    except PmError as exc:
+        log("%s failed: [%s] %s" % (verb, exc.code, exc.message))
+        write({"type": "error", "code": exc.code, "message": exc.message})
+    except Exception as exc:  # noqa: BLE001 - never let one request kill the daemon
+        log("%s crashed:\n%s" % (verb, traceback.format_exc()))
+        write({"type": "error", "code": "internal", "message": str(exc)})
+
+
+def peer_credentials(conn: socket.socket) -> Optional[Tuple[int, int, int]]:
+    try:
+        raw = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+    except OSError:
+        return None
+    pid, uid, gid = struct.unpack("3i", raw)
+    return pid, uid, gid
+
+
+def serve_connection(cfg: Config, conn: socket.socket, verbs: Optional[Dict[str, Any]] = None):
+    lock = threading.Lock()
+
+    def write(event: Dict[str, Any]) -> None:
+        payload = (json.dumps(event) + "\n").encode("utf-8")
+        with lock:
+            try:
+                conn.sendall(payload)
+            except OSError:
+                pass  # client hung up mid-operation; the verb still finishes
+
+    try:
+        creds = peer_credentials(conn)
+        with conn.makefile("rb") as reader:
+            raw = reader.readline(MAX_REQUEST_BYTES)
+        if not raw.strip():
+            write({"type": "error", "code": "bad_request", "message": "empty request"})
+            return
+        if creds:
+            log("request from pid=%d uid=%d gid=%d" % creds)
+        handle_request(cfg, raw, write, verbs)
+    finally:
+        try:
+            conn.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        conn.close()
+
+
+def listening_socket(cfg: Config) -> socket.socket:
+    """Prefer a systemd-activated socket; fall back to binding it ourselves."""
+    if os.environ.get("LISTEN_FDS") and os.environ.get("LISTEN_PID") == str(os.getpid()):
+        sock = socket.socket(fileno=SD_LISTEN_FDS_START)
+        sock.setblocking(True)
+        return sock
+    path = cfg.socket_path
+    ensure_dir(os.path.dirname(path), 0o755, 0, pm_gid(cfg))
+    try:
+        os.unlink(path)
+    except OSError as exc:
+        if exc.errno != errno.ENOENT:
+            raise
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(path)
+    os.chown(path, 0, pm_gid(cfg))
+    os.chmod(path, 0o660)
+    sock.listen(16)
+    return sock
+
+
+def serve(cfg: Config) -> None:
+    require_root()
+    sock = listening_socket(cfg)
+    log("listening on %s" % cfg.socket_path)
+    while True:
+        try:
+            conn, _ = sock.accept()
+        except KeyboardInterrupt:
+            return
+        except OSError as exc:
+            if exc.errno == errno.EINTR:
+                continue
+            raise
+        threading.Thread(target=serve_connection, args=(cfg, conn), daemon=True).start()
+
+
+# --------------------------------------------------------------------------
+# Client
+# --------------------------------------------------------------------------
+
+
+def call_socket(socket_path: str, verb: str, args: Dict[str, Any]) -> int:
+    """Send one request and print the streamed events. Returns an exit code."""
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        conn.connect(socket_path)
+    except OSError as exc:
+        print("cannot connect to %s: %s" % (socket_path, exc), file=sys.stderr)
+        return 1
+    with conn:
+        conn.sendall((json.dumps({"verb": verb, "args": args}) + "\n").encode("utf-8"))
+        exit_code = 1
+        with conn.makefile("rb") as reader:
+            for line in reader:
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    print(line.decode("utf-8", "replace").rstrip(), file=sys.stderr)
+                    continue
+                kind = event.get("type")
+                if kind == "progress":
+                    print(
+                        "· %s: %s" % (event.get("step"), event.get("message")), file=sys.stderr
+                    )
+                elif kind == "result":
+                    print(json.dumps(event.get("data"), indent=2, sort_keys=True))
+                    exit_code = 0
+                elif kind == "error":
+                    print(
+                        "error [%s] %s" % (event.get("code"), event.get("message")),
+                        file=sys.stderr,
+                    )
+                    exit_code = 1
+        return exit_code
+
+
+def run_local(cfg: Config, verb: str, args: Dict[str, Any]) -> int:
+    exit_code = 1
+
+    def write(event: Dict[str, Any]) -> None:
+        nonlocal exit_code
+        kind = event.get("type")
+        if kind == "progress":
+            print("· %s: %s" % (event.get("step"), event.get("message")), file=sys.stderr)
+        elif kind == "result":
+            print(json.dumps(event.get("data"), indent=2, sort_keys=True))
+            exit_code = 0
+        elif kind == "error":
+            print("error [%s] %s" % (event.get("code"), event.get("message")), file=sys.stderr)
+            exit_code = 1
+
+    handle_request(cfg, json.dumps({"verb": verb, "args": args}).encode("utf-8"), write)
+    return exit_code
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="pm-projectctl",
+        description="Privileged helper for the PM system (see docs/pm-system-plan.md).",
+    )
+    parser.add_argument(
+        "--remote",
+        action="store_true",
+        help="send the verb to a running pm-projectctl over its control socket "
+        "instead of executing it locally",
+    )
+    parser.add_argument("--socket", help="control socket path (implies --remote)")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("serve", help="run the control socket daemon (root)")
+
+    create = sub.add_parser("create", help="provision a project from a git URL")
+    create.add_argument("name")
+    create.add_argument("git_url")
+
+    for verb in ("start", "stop"):
+        node = sub.add_parser(verb, help="%s a project's daemon and runner" % verb)
+        node.add_argument("name")
+
+    status = sub.add_parser("status", help="report project state")
+    status.add_argument("name", nargs="?")
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_parser()
+    opts = parser.parse_args(argv)
+    try:
+        cfg = load_config()
+    except PmError as exc:
+        print("error [%s] %s" % (exc.code, exc.message), file=sys.stderr)
+        return 1
+
+    if opts.command == "serve":
+        try:
+            serve(cfg)
+        except PmError as exc:
+            print("error [%s] %s" % (exc.code, exc.message), file=sys.stderr)
+            return 1
+        return 0
+
+    args: Dict[str, Any] = {}
+    if getattr(opts, "name", None) is not None:
+        args["name"] = opts.name
+    if getattr(opts, "git_url", None) is not None:
+        args["gitUrl"] = opts.git_url
+
+    if opts.remote or opts.socket:
+        return call_socket(opts.socket or cfg.socket_path, opts.command, args)
+    return run_local(cfg, opts.command, args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

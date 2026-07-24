@@ -1,0 +1,22 @@
+# The one root-touching service of the PM system: it creates project users,
+# wires up their rootless docker daemons and mints their deploy keys.
+#
+# Deliberately unsandboxed: it needs to write /etc/passwd, /etc/subuid, project
+# homes and /run/user, and to reach every project's systemd manager over D-Bus,
+# so ProtectSystem/ProtectHome/PrivateUsers would all have to be turned off
+# again. The security boundary is the socket above (group `pm`) plus the
+# strictly validated verb set — not sandboxing.
+[Unit]
+Description=pm-projectctl privileged helper
+Requires=pm-projectctl.socket
+After=pm-projectctl.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/pm-projectctl serve
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+Also=pm-projectctl.socket
