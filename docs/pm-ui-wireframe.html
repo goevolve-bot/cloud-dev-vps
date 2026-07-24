@@ -1,0 +1,418 @@
+<title>PM System — UI Wireframe v1</title>
+<style>
+  :root {
+    --bg: #f4f4f3; --surface: #ffffff; --surface2: #ecebe9; --fill: #e3e1de;
+    --border: #d8d6d2; --border-strong: #b8b5b0; --ink: #2a2827; --muted: #807c76;
+    --accent: #0f766e; --accent-ink: #ffffff; --accent-soft: rgba(15,118,110,.08);
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1b1a19; --surface: #252423; --surface2: #2d2b29; --fill: #343230;
+      --border: #403d3a; --border-strong: #57534e; --ink: #e6e4e1; --muted: #98938c;
+      --accent: #3ec9b8; --accent-ink: #10201d; --accent-soft: rgba(62,201,184,.1);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #1b1a19; --surface: #252423; --surface2: #2d2b29; --fill: #343230;
+    --border: #403d3a; --border-strong: #57534e; --ink: #e6e4e1; --muted: #98938c;
+    --accent: #3ec9b8; --accent-ink: #10201d; --accent-soft: rgba(62,201,184,.1);
+  }
+  :root[data-theme="light"] {
+    --bg: #f4f4f3; --surface: #ffffff; --surface2: #ecebe9; --fill: #e3e1de;
+    --border: #d8d6d2; --border-strong: #b8b5b0; --ink: #2a2827; --muted: #807c76;
+    --accent: #0f766e; --accent-ink: #ffffff; --accent-soft: rgba(15,118,110,.08);
+  }
+  body { background: var(--bg); color: var(--ink); font: 14px/1.5 system-ui, sans-serif;
+         margin: 0; padding: 24px 16px 64px; }
+  .wrap { max-width: 1160px; margin: 0 auto; display: flex; flex-direction: column; gap: 28px; }
+  h1 { font-size: 20px; margin: 0; }
+  h2 { font-size: 15px; margin: 0 0 8px; }
+  .sub { color: var(--muted); margin: 4px 0 0; max-width: 65ch; }
+  section > .sub { margin-bottom: 10px; }
+
+  /* wireframe scaffolding */
+  .frame { background: var(--surface); border: 1px solid var(--border-strong);
+           border-radius: 6px; overflow: hidden; font-size: 12px; }
+  .ph { background: var(--fill); border-radius: 3px; }
+  .dashed { border: 1px dashed var(--border-strong); background: transparent; }
+  .chip { display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--border);
+          border-radius: 999px; padding: 0 7px; height: 18px; font-size: 10.5px;
+          color: var(--muted); background: var(--surface2); white-space: nowrap; }
+  .chip.solid { background: var(--fill); color: var(--ink); }
+  .btn { display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--border-strong);
+         border-radius: 4px; padding: 2px 8px; font-size: 11px; background: var(--surface2);
+         white-space: nowrap; }
+  .btn.primary { background: var(--ink); color: var(--surface); border-color: var(--ink); }
+  .sel { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border);
+         border-radius: 4px; padding: 2px 7px; font-size: 11px; background: var(--surface);
+         white-space: nowrap; }
+  .sel::after { content: "▾"; color: var(--muted); font-size: 9px; }
+  .mono { font-family: var(--mono); font-size: 10.5px; }
+  .muted { color: var(--muted); }
+  .note { position: relative; display: inline-flex; align-items: center; justify-content: center;
+          min-width: 15px; height: 15px; border-radius: 999px; background: var(--accent);
+          color: var(--accent-ink); font-size: 10px; font-weight: 700; padding: 0 3px;
+          vertical-align: 2px; }
+  .legend { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 8px 20px; margin: 0; padding: 0; list-style: none; }
+  .legend li { display: flex; gap: 8px; align-items: baseline; font-size: 13px; }
+  .legend .note { flex: none; }
+  .caption { font-size: 11px; color: var(--muted); margin-top: 6px; }
+
+  /* header bar */
+  .hbar { display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+          border-bottom: 1px solid var(--border); background: var(--surface2); flex-wrap: wrap; }
+  .logo { font-weight: 700; font-size: 12px; letter-spacing: .04em; }
+  .tabs { display: flex; gap: 2px; }
+  .tab { padding: 3px 10px; border-radius: 4px; font-size: 11.5px; color: var(--muted); }
+  .tab.on { background: var(--surface); border: 1px solid var(--border); color: var(--ink); font-weight: 600; }
+  .search { flex: 1 1 120px; max-width: 260px; border: 1px solid var(--border); border-radius: 4px;
+            padding: 2px 8px; color: var(--muted); background: var(--surface); font-size: 11px; }
+  .spacer { flex: 1; }
+
+  /* desktop grid */
+  .desk { display: grid; grid-template-columns: 232px 1fr; min-height: 560px; }
+  .side { border-right: 1px solid var(--border); background: var(--surface); display: flex;
+          flex-direction: column; }
+  .side .group { border-bottom: 1px solid var(--border); }
+  .ghead { display: flex; align-items: center; gap: 6px; padding: 4px 8px; font-size: 10px;
+           letter-spacing: .07em; text-transform: uppercase; color: var(--muted);
+           background: var(--surface2); }
+  .trow { display: flex; align-items: center; gap: 6px; padding: 4px 8px 4px 14px;
+          border-top: 1px solid var(--border); font-size: 11.5px; }
+  .trow.on { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); }
+  .trow .id { font-family: var(--mono); font-size: 10px; color: var(--muted); flex: none; }
+  .trow .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dot { width: 6px; height: 6px; border-radius: 999px; background: var(--muted); flex: none; }
+  .dot.live { background: var(--accent); }
+
+  .main { display: flex; flex-direction: column; min-width: 0; }
+  .trow-head { display: flex; align-items: center; gap: 8px; padding: 7px 12px;
+               border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .launch { display: flex; align-items: center; gap: 6px; padding: 6px 12px;
+            border-bottom: 1px solid var(--border); background: var(--surface2); flex-wrap: wrap; }
+  .desc { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  .lines { display: flex; flex-direction: column; gap: 5px; }
+  .lines .ph { height: 8px; }
+  .att { display: flex; gap: 6px; margin-top: 9px; flex-wrap: wrap; }
+  .thumb { width: 52px; height: 36px; display: flex; align-items: center; justify-content: center;
+           color: var(--muted); font-size: 9px; }
+  .tl { padding: 8px 12px; display: flex; flex-direction: column; gap: 6px; }
+  .ev { display: flex; gap: 8px; align-items: flex-start; }
+  .ev .rail { width: 14px; flex: none; display: flex; justify-content: center; padding-top: 4px; }
+  .ev .body { flex: 1; min-width: 0; border: 1px solid var(--border); border-radius: 4px;
+              padding: 5px 8px; background: var(--surface); }
+  .ev .meta { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; font-size: 10.5px;
+              color: var(--muted); }
+  .ev.plain .body { border: none; padding: 2px 0; background: none; }
+  .log { margin-top: 6px; border: 1px solid var(--border); border-radius: 4px;
+         background: var(--surface2); padding: 6px 8px; font-family: var(--mono);
+         font-size: 10px; color: var(--muted); line-height: 1.7; overflow-x: auto; }
+  .gallery { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+  .composer { display: flex; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--border);
+              margin-top: auto; background: var(--surface2); }
+  .composer .in { flex: 1; border: 1px solid var(--border); border-radius: 4px; padding: 3px 8px;
+                  color: var(--muted); background: var(--surface); font-size: 11px; }
+
+  /* small frame pairs */
+  .pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+  .docgrid { display: grid; grid-template-columns: 150px 1fr; min-height: 260px; }
+  .doclist { border-right: 1px solid var(--border); }
+  .drow { display: flex; align-items: center; gap: 6px; padding: 4px 8px;
+          border-bottom: 1px solid var(--border); font-size: 11px; }
+  .drow.on { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); }
+  .docbody { padding: 10px 12px; }
+  .modal-veil { background: var(--surface2); padding: 22px; display: flex; justify-content: center; }
+  .modal { background: var(--surface); border: 1px solid var(--border-strong); border-radius: 6px;
+           width: 100%; max-width: 330px; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+  .field { display: flex; flex-direction: column; gap: 3px; font-size: 10.5px; color: var(--muted); }
+  .field .in { border: 1px solid var(--border); border-radius: 4px; padding: 3px 8px;
+               color: var(--muted); background: var(--surface); }
+  .keyblock { border: 1px dashed var(--border-strong); border-radius: 4px; padding: 6px 8px;
+              font-family: var(--mono); font-size: 9.5px; color: var(--muted);
+              word-break: break-all; }
+
+  /* mobile strip */
+  .mstrip { display: flex; gap: 16px; flex-wrap: wrap; }
+  .mframe { width: 240px; flex: none; }
+  .mbar { display: flex; align-items: center; gap: 6px; padding: 5px 8px;
+          border-bottom: 1px solid var(--border); background: var(--surface2); font-size: 11px; }
+  .mbody { display: flex; flex-direction: column; }
+
+  footer { color: var(--muted); font-size: 12px; border-top: 1px solid var(--border); padding-top: 12px; }
+  @media (max-width: 700px) { .desk { grid-template-columns: 1fr; } .side { border-right: none;
+    border-bottom: 1px solid var(--border); } }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>PM System — UI wireframe v1</h1>
+    <p class="sub">Grayscale on purpose: react to layout, density, and behavior (numbered badges),
+    not colors. Everything is compact — dense paddings, no hero spacing.</p>
+  </header>
+
+  <!-- ===================== DESKTOP ===================== -->
+  <section>
+    <h2>Desktop — Tasks tab, task open</h2>
+    <div class="frame">
+      <div class="hbar">
+        <span class="logo">▣ pm</span>
+        <span class="sel">myshop <span class="note">1</span></span>
+        <nav class="tabs"><span class="tab on">Tasks</span><span class="tab">Specs</span><span class="tab">ADRs</span><span class="note">2</span></nav>
+        <span class="search">⌕ search tasks, specs, adrs…</span><span class="note">3</span>
+        <span class="spacer"></span>
+        <span class="chip"><span class="dot live"></span> active</span><span class="note">4</span>
+        <span class="btn">⏻</span>
+      </div>
+      <div class="desk">
+        <aside class="side">
+          <div style="padding:6px 8px; border-bottom:1px solid var(--border)"><span class="btn" style="width:100%; justify-content:center">+ new task</span></div>
+          <div class="group">
+            <div class="ghead">▾ todo <span class="muted">3</span></div>
+            <div class="trow"><span class="id">#17</span><span class="t">Export orders to CSV</span></div>
+            <div class="trow"><span class="id">#16</span><span class="t">Rate-limit password reset</span></div>
+            <div class="trow"><span class="id">#15</span><span class="t">Dark theme for emails</span></div>
+          </div>
+          <div class="group">
+            <div class="ghead">▾ in progress <span class="muted">2</span> <span class="note">5</span></div>
+            <div class="trow on"><span class="id">#12</span><span class="t">Promo codes at checkout</span><span class="dot live"></span></div>
+            <div class="trow"><span class="id">#9</span><span class="t">Fix login redirect loop</span></div>
+          </div>
+          <div class="group">
+            <div class="ghead">▾ ready for review <span class="muted">1</span></div>
+            <div class="trow"><span class="id">#11</span><span class="t">Bulk product import</span></div>
+          </div>
+          <div class="group">
+            <div class="ghead">▾ blocked <span class="muted">1</span></div>
+            <div class="trow"><span class="id">#8</span><span class="t">Payments provider sandbox…</span></div>
+          </div>
+          <div class="group">
+            <div class="ghead">▸ done <span class="muted">12</span></div>
+          </div>
+        </aside>
+
+        <div class="main">
+          <div class="trow-head">
+            <strong style="font-size:13px">#12 Promo codes at checkout</strong>
+            <span class="sel">in progress</span>
+            <span class="chip mono">pm/task-12-promo-codes</span>
+            <span class="spacer"></span>
+            <span class="chip"><span class="dot live"></span> implement running · 06:41</span>
+          </div>
+          <div class="launch">
+            <span class="muted" style="font-size:10px; letter-spacing:.06em">RUN:</span>
+            <span class="sel">phase · implement</span>
+            <span class="sel">provider · claude</span>
+            <span class="sel">model · sonnet-5</span>
+            <span class="btn primary">▶ run</span><span class="note">6</span>
+            <span class="spacer"></span>
+            <span class="btn">interview</span><span class="btn">plan</span><span class="btn">verify</span><span class="btn">review</span>
+          </div>
+          <div class="desc">
+            <div class="meta" style="display:flex; gap:8px; margin-bottom:7px; align-items:center">
+              <span class="muted" style="font-size:10px; letter-spacing:.06em">DESCRIPTION</span>
+              <span class="chip">edit</span><span class="chip solid">preview</span>
+              <span class="note">7</span>
+            </div>
+            <div class="lines">
+              <span class="ph" style="width:88%"></span>
+              <span class="ph" style="width:95%"></span>
+              <span class="ph" style="width:72%"></span>
+              <span class="ph" style="width:40%"></span>
+            </div>
+            <div class="att">
+              <span class="thumb ph">img</span>
+              <span class="chip mono">pasted-01.md ×</span>
+              <span class="chip mono">specs.pdf ×</span>
+              <span class="btn">+ attach</span>
+            </div>
+          </div>
+          <div class="tl">
+            <span class="muted" style="font-size:10px; letter-spacing:.06em">TIMELINE <span class="note">8</span></span>
+            <div class="ev plain">
+              <div class="rail"><span class="dot"></span></div>
+              <div class="body meta">status: todo → in progress · 2d ago</div>
+            </div>
+            <div class="ev">
+              <div class="rail"><span class="dot"></span></div>
+              <div class="body">
+                <div class="meta"><span class="chip solid">interview</span> claude · sonnet-5 · ✓ · 3m · 2d ago</div>
+                <div class="meta" style="margin-top:3px; color:var(--ink)">5 questions → answered ✓ → description refined</div>
+              </div>
+            </div>
+            <div class="ev">
+              <div class="rail"><span class="dot"></span></div>
+              <div class="body">
+                <div class="meta">you · yesterday</div>
+                <div class="lines" style="margin-top:4px"><span class="ph" style="width:60%"></span></div>
+              </div>
+            </div>
+            <div class="ev">
+              <div class="rail"><span class="dot live"></span></div>
+              <div class="body">
+                <div class="meta"><span class="chip solid">implement</span> claude · sonnet-5 · <span style="color:var(--accent)">running 06:41</span> · <span class="chip">■ stop</span></div>
+                <div class="log">
+                  [12:04:11] edit src/checkout/cart.ts<br>
+                  [12:04:19] $ docker compose run --rm test<br>
+                  [12:04:52] ✓ 41 passed, 1 failed — retrying…<span class="note">9</span>
+                </div>
+              </div>
+            </div>
+            <div class="ev">
+              <div class="rail"><span class="dot"></span></div>
+              <div class="body">
+                <div class="meta"><span class="chip solid">verify</span> ✓ healthy · test ✓ · e2e ✓ · 4m (previous run)</div>
+                <div class="gallery">
+                  <span class="thumb ph">shot 1</span><span class="thumb ph">shot 2</span>
+                  <span class="thumb ph">▶ gif</span><span class="note">10</span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="composer">
+            <span class="in">write a follow-up…</span>
+            <span class="btn">post</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <ol class="legend" style="margin-top:12px">
+      <li><span class="note">1</span> Project selector; last entry is “+ add project…” → modal below. Daemon state shown per project.</li>
+      <li><span class="note">2</span> Tabs, not a dropdown: Tasks / Specs / ADRs — all read from the repo’s <span class="mono">.pm/</span> dir.</li>
+      <li><span class="note">3</span> Search over the cached index of tasks + specs + ADRs in the current project.</li>
+      <li><span class="note">4</span> Project daemon badge: active / idle / stopped; click → toggle, “always on” pin.</li>
+      <li><span class="note">5</span> Status groups = folders in <span class="mono">.pm/tasks/</span>; collapse per group; live dot on tasks with a running agent.</li>
+      <li><span class="note">6</span> Launch bar: phase × provider × model. Quick buttons launch other phases with project defaults.</li>
+      <li><span class="note">7</span> Markdown editor: paste image → attachment; huge text paste → <span class="mono">pasted-NN.md</span> attachment (as in Claude chats); explicit “+ attach” for files. All stored under the task folder in the repo.</li>
+      <li><span class="note">8</span> Timeline mixes status moves, comments, and runs — each backed by a file in the task folder; newest at the bottom, composer fixed below.</li>
+      <li><span class="note">9</span> Running agent: live log tail via SSE (from pm data dir, not the repo); stop button; full raw log on click.</li>
+      <li><span class="note">10</span> Verify artifacts: screenshot thumbnails + GIF/video inline; click → lightbox.</li>
+    </ol>
+  </section>
+
+  <!-- ===================== SPECS/ADR + MODAL ===================== -->
+  <section>
+    <h2>Specs / ADRs tab · Add-project modal</h2>
+    <div class="pair">
+      <div>
+        <div class="frame">
+          <div class="hbar">
+            <span class="logo">▣ pm</span>
+            <span class="sel">myshop</span>
+            <nav class="tabs"><span class="tab">Tasks</span><span class="tab">Specs</span><span class="tab on">ADRs</span></nav>
+            <span class="spacer"></span><span class="btn">⏻</span>
+          </div>
+          <div class="docgrid">
+            <div class="doclist">
+              <div class="drow"><span class="mono">001</span> sqlite over pg <span class="chip">ok</span></div>
+              <div class="drow on"><span class="mono">002</span> promo engine <span class="chip">ok</span></div>
+              <div class="drow"><span class="mono">003</span> graphql api <span class="chip">✕</span><span class="note">11</span></div>
+            </div>
+            <div class="docbody">
+              <div class="meta" style="display:flex; gap:6px; margin-bottom:8px">
+                <span class="chip solid">accepted</span><span class="chip mono">.pm/adrs/002-promo-engine.md</span>
+                <span class="chip">history</span>
+              </div>
+              <div class="lines">
+                <span class="ph" style="width:50%; height:11px"></span>
+                <span class="ph" style="width:92%"></span>
+                <span class="ph" style="width:85%"></span>
+                <span class="ph" style="width:64%"></span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <p class="caption">Same layout for Specs (living “actual state” docs). ADRs carry status:
+        accepted / superseded / abandoned — abandoned ones stay listed so idea evolution is visible.</p>
+      </div>
+      <div>
+        <div class="frame">
+          <div class="modal-veil">
+            <div class="modal">
+              <strong style="font-size:12px">Add project <span class="note">12</span></strong>
+              <label class="field">name <span class="in">myshop</span></label>
+              <label class="field">git url <span class="in">git@github.com:titarenko/myshop.git</span></label>
+              <div class="field">deploy key — add it to your git host, then continue
+                <div class="keyblock">ssh-ed25519 AAAAC3NzaC1lZDI1… pm-myshop <span class="chip">copy</span></div>
+              </div>
+              <div style="display:flex; gap:6px; justify-content:flex-end">
+                <span class="btn">cancel</span>
+                <span class="btn primary">I added the key → create</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <p class="caption">Runs the whole add-repo flow via <span class="mono">pm-projectctl create</span>:
+        OS user + rootless daemon + deploy key + clone + <span class="mono">.pm/</span> scaffold.
+        Empty repos allowed. “Delete project” lives in project settings with typed confirmation
+        (stop daemon + remove user; purging repo/volumes is a separate checkbox).</p>
+      </div>
+    </div>
+    <ol class="legend" style="margin-top:12px">
+      <li><span class="note">11</span> ✕ = abandoned ADR — kept and rendered, struck through in the list.</li>
+      <li><span class="note">12</span> Two-step modal replaces the interactive SSH script; pubkey shown until first fetch succeeds.</li>
+    </ol>
+  </section>
+
+  <!-- ===================== MOBILE ===================== -->
+  <section>
+    <h2>Mobile — same app, adaptive</h2>
+    <div class="mstrip">
+      <div class="frame mframe">
+        <div class="mbar"><span class="btn">☰</span><span class="sel">myshop</span><span class="spacer"></span><span class="dot live"></span></div>
+        <div class="mbody">
+          <div class="hbar" style="padding:4px 8px"><span class="tab on">Tasks</span><span class="tab">Specs</span><span class="tab">ADRs</span></div>
+          <div class="ghead">▾ in progress</div>
+          <div class="trow"><span class="id">#12</span><span class="t">Promo codes at checkout</span><span class="dot live"></span></div>
+          <div class="trow"><span class="id">#9</span><span class="t">Fix login redirect loop</span></div>
+          <div class="ghead">▾ todo</div>
+          <div class="trow"><span class="id">#17</span><span class="t">Export orders to CSV</span></div>
+          <div class="trow"><span class="id">#16</span><span class="t">Rate-limit password reset</span></div>
+          <div class="ghead">▸ ready for review · done</div>
+        </div>
+      </div>
+      <div class="frame mframe">
+        <div class="mbar"><span class="btn">←</span><strong style="font-size:11px">#12 Promo codes</strong><span class="spacer"></span><span class="sel">in prog.</span></div>
+        <div class="mbody">
+          <div class="launch" style="padding:5px 8px">
+            <span class="sel">implement</span><span class="sel">claude</span><span class="btn primary">▶</span>
+          </div>
+          <div class="desc" style="padding:8px">
+            <div class="lines"><span class="ph" style="width:92%"></span><span class="ph" style="width:70%"></span></div>
+            <div class="att"><span class="thumb ph">img</span><span class="btn">+ attach</span></div>
+          </div>
+          <div class="tl" style="padding:6px 8px">
+            <div class="ev"><div class="rail"><span class="dot live"></span></div>
+              <div class="body"><div class="meta"><span class="chip solid">implement</span> running · tap for log</div></div></div>
+            <div class="ev"><div class="rail"><span class="dot"></span></div>
+              <div class="body"><div class="meta"><span class="chip solid">verify</span> ✓ · 2 shots · gif</div></div></div>
+          </div>
+          <div class="composer" style="padding:6px 8px"><span class="in">follow-up…</span><span class="btn">➤</span></div>
+        </div>
+      </div>
+      <div class="frame mframe">
+        <div class="mbar"><span class="btn">←</span><strong style="font-size:11px">run #34 · implement</strong><span class="spacer"></span><span class="chip">■ stop</span></div>
+        <div class="mbody" style="padding:8px">
+          <div class="log" style="margin:0">
+            [12:04:11] edit src/checkout/cart.ts<br>
+            [12:04:19] $ docker compose run --rm test<br>
+            [12:04:52] ✓ 41 passed, 1 failed<br>
+            [12:05:03] edit src/promo/rules.ts<br>
+            [12:05:20] $ docker compose run --rm test<br>
+            [12:05:58] ✓ 42 passed<br>
+            ▍
+          </div>
+          <div class="gallery"><span class="thumb ph">shot 1</span><span class="thumb ph">▶ gif</span></div>
+        </div>
+      </div>
+    </div>
+    <p class="caption">Task list, task view, and run/log view become separate screens; the launch bar
+    collapses to phase + provider (model under the phase sheet). Sidebar → drawer behind ☰.</p>
+  </section>
+
+  <footer>
+    v1 — comment on anything: density, sidebar grouping, timeline vs separate logs tab,
+    modal flow, mobile splits. Statuses: todo / in progress / ready for review / done / blocked.
+  </footer>
+</div>
