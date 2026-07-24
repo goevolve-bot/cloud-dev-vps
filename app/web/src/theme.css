@@ -79,6 +79,12 @@ body {
 button {
   font: inherit;
   color: inherit;
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  text-align: inherit;
+  cursor: pointer;
 }
 
 .shell {
@@ -209,4 +215,155 @@ button {
 .page-placeholder {
   padding: 16px;
   color: var(--muted);
+}
+
+.mono {
+  font-family: var(--mono);
+}
+
+.chip.solid {
+  background: var(--fill);
+  color: var(--ink);
+}
+
+/* task list + task view */
+
+.desk {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.side {
+  width: 232px;
+  flex: none;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+.side-new {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.new-task-btn {
+  width: 100%;
+  justify-content: center;
+}
+
+.new-task-form {
+  display: flex;
+  gap: 4px;
+}
+
+.new-task-form .search {
+  max-width: none;
+  flex: 1;
+}
+
+.group {
+  border-bottom: 1px solid var(--border);
+}
+
+.ghead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  width: 100%;
+  padding: 4px 8px;
+  font-size: 10px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--muted);
+  background: var(--surface2);
+}
+
+.trow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 4px 8px 4px 14px;
+  border-top: 1px solid var(--border);
+  font-size: 11.5px;
+}
+
+.trow.on {
+  background: var(--accent-soft);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.trow .id {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--muted);
+  flex: none;
+}
+
+.trow .t {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow-y: auto;
+}
+
+.trow-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+.desc {
+  padding: 10px 12px;
+  flex: 1;
+}
+
+.desc-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 7px;
+}
+
+.small-label {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+}
+
+.desc-editor {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  resize: vertical;
+}
+
+.markdown {
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.markdown :first-child {
+  margin-top: 0;
+}
+
+.markdown :last-child {
+  margin-bottom: 0;
 }

@@ -88,6 +88,12 @@ importers:
 
   web:
     dependencies:
+      dompurify:
+        specifier: ^3.2.3
+        version: 3.4.12
+      marked:
+        specifier: ^15.0.6
+        version: 15.0.12
       react:
         specifier: ^19.0.0
         version: 19.2.8
@@ -943,6 +949,12 @@ packages:
         integrity: sha512-MXfmqaVPEVgkBT/aY0aGCkRWWtByiYQXo3xdQ8r5RzuFrPiRn8Gar2tQdXSUQ2GKV3bkXckek89V8wQBY2Q/Aw==,
       }
 
+  "@types/trusted-types@2.0.7":
+    resolution:
+      {
+        integrity: sha512-ScaPdn1dQczgbl0QFTeTOmVHFULt394XJgOQNoyVhZ6r2vLnMLJfBPd53SB52T/3G36VI1/g2MZaX0cwDuXsfw==,
+      }
+
   "@typescript-eslint/eslint-plugin@8.65.0":
     resolution:
       {
@@ -1300,6 +1312,12 @@ packages:
         integrity: sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ==,
       }
     engines: { node: ">=8" }
+
+  dompurify@3.4.12:
+    resolution:
+      {
+        integrity: sha512-zQvGet8Z2sWbQhCmfFz/T5QWH2oBmjnqK3qvOjaqaNLrLEF912WamU+ohnTp0TCep/MFVHpdJuCZEdFOdTnEFg==,
+      }
 
   electron-to-chromium@1.5.395:
     resolution:
@@ -1763,6 +1781,14 @@ packages:
       {
         integrity: sha512-KpNARQA3Iwv+jTA0utUVVbrh+Jlrr1Fv0e56GGzAFOXN7dk/FviaDW8LHmK52DlcH4WP2n6gI8vN1aesBFgo9w==,
       }
+
+  marked@15.0.12:
+    resolution:
+      {
+        integrity: sha512-8dD6FusOQSrpv9Z1rdNMdlSgQOIP880DHqnohobOmYLElGEqAL/JvxvuxZO16r4HtjTlfPRDC1hbvxC9dPN2nA==,
+      }
+    engines: { node: ">= 18" }
+    hasBin: true
 
   mimic-response@3.1.0:
     resolution:
@@ -2826,6 +2852,9 @@ snapshots:
     dependencies:
       csstype: 3.2.3
 
+  "@types/trusted-types@2.0.7":
+    optional: true
+
   "@typescript-eslint/eslint-plugin@8.65.0(@typescript-eslint/parser@8.65.0(eslint@9.39.5(supports-color@7.2.0))(supports-color@7.2.0)(typescript@5.9.3))(eslint@9.39.5(supports-color@7.2.0))(supports-color@7.2.0)(typescript@5.9.3)":
     dependencies:
       "@eslint-community/regexpp": 4.12.2
@@ -3061,6 +3090,10 @@ snapshots:
   dequal@2.0.3: {}
 
   detect-libc@2.1.2: {}
+
+  dompurify@3.4.12:
+    optionalDependencies:
+      "@types/trusted-types": 2.0.7
 
   electron-to-chromium@1.5.395: {}
 
@@ -3342,6 +3375,8 @@ snapshots:
   lru-cache@5.1.1:
     dependencies:
       yallist: 3.1.1
+
+  marked@15.0.12: {}
 
   mimic-response@3.1.0: {}
 
