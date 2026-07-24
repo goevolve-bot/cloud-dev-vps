@@ -6,6 +6,7 @@ packages:
 
 allowBuilds:
   better-sqlite3: true
+  esbuild: true
 
 catalog:
   typescript: ^5.7.3
