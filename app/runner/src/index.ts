@@ -1,4 +1,19 @@
-// Per-project runner: owns the rootless docker socket and secrets, exposes the
-// narrow control API (startRun/stopRun/streamLogs/status/commitAndPush) — see
-// T10 in docs/pm-task-breakdown.md.
-export const RUNNER_PACKAGE_NAME = "@pm/runner";
+import { createRunnerServer } from "./socket-server.js";
+
+const project = process.env.PM_PROJECT;
+const socketPath = process.env.PM_RUNNER_SOCKET;
+
+if (!project || !socketPath) {
+  console.error("pm runner: PM_PROJECT and PM_RUNNER_SOCKET must both be set");
+  process.exit(1);
+}
+
+const server = createRunnerServer({ project, socketPath });
+console.log(`pm runner for ${project} listening on ${socketPath}`);
+
+function shutdown(): void {
+  server.close(() => process.exit(0));
+}
+
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
