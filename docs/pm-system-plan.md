@@ -94,7 +94,8 @@ host
 │    ~/.ssh/deploy_key            0600, pm-proj1 only  (clone/commit/push)
 │    ~/.pm-creds/oauth            0600, pm-proj1 only  (provider login)
 │    ~/work/<repo>                the clone (.pm/ tree group-readable by pm)
-│    runner  → control socket /srv/pm/runners/proj1.sock (group pm)
+│    runner  → control socket /srv/pm/runners/proj1/control.sock
+│                (dir pm-proj1:pm 2750 — pm connects, other projects can't)
 │       verbs: startRun · stopRun · streamLogs · status · commitAndPush
 │    ├─ agent container (per run): pm-agent image = git + docker CLI +
 │    │    claude + agy, NO project toolchains. Mounts the repo, the dockerd
@@ -158,7 +159,11 @@ a strictly validated verb set:
   and waits, like `add-repo` did in the terminal), store the shared provider
   OAuth token into the user's `~/.pm-creds` (0600), clone the repo with the
   key, and scaffold `.pm/` if the repo is empty. Only the runner control
-  socket is exposed to pm.
+  socket is exposed to pm. Every step is idempotent and the verb is
+  **resumable**: a repo the fresh key cannot reach yet returns
+  `status: awaiting-key` plus the public key instead of failing, and the same
+  call re-issued after the key is authorized picks up at the clone — that is
+  what the two-step add-project modal drives.
 - `delete <project>` — stop the daemon and remove the user; purging the repo
   volume and image store is a separate explicit flag. The UI requires typed
   confirmation and offers "remove but keep data" vs "purge".
@@ -425,7 +430,8 @@ roles/
 
 - **`roles/pm`**: create the `pm` user with its own rootless dockerd (reusing
   the tasks from `docker_rootless.yml`, generalized); create the `pm` group and
-  `/srv/pm/runners/` (runner control sockets, group-readable by pm only); sync
+  `/srv/pm/runners/` (one `<project>/` subdir per project, owned
+  `pm-<project>:pm` 2750, holding that project's control socket); sync
   `app/` to the VPS; build `pm` + `pm-agent` images and bring up the compose
   stack as the `pm` user (systemd user unit wrapping `docker compose up -d`,
   linger enabled); set sysctl `net.ipv4.ip_unprivileged_port_start=443`;

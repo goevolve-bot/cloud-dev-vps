@@ -1,0 +1,15 @@
+# Control socket for the PM system's privileged helper. Ownership is declared
+# here rather than in code so the permission boundary is visible in the unit:
+# root owns it, group `pm` (the web app) may connect, nobody else.
+[Unit]
+Description=pm-projectctl control socket
+
+[Socket]
+ListenStream=/srv/pm/projectctl.sock
+SocketUser=root
+SocketGroup=pm
+SocketMode=0660
+Accept=no
+
+[Install]
+WantedBy=sockets.target
