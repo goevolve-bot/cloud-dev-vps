@@ -118,3 +118,95 @@ export async function uploadAttachment(
   const body = (await response.json()) as { filename: string };
   return body.filename;
 }
+
+export interface Comment {
+  readonly id: number;
+  readonly project_id: number;
+  readonly task_num: number;
+  readonly comment_num: number;
+  readonly author: string | null;
+  readonly body: string;
+  readonly path: string;
+  readonly created_at: string;
+}
+
+export interface TaskRun {
+  readonly id: number;
+  readonly project_id: number;
+  readonly task_num: number;
+  readonly run_num: number;
+  readonly phase: string;
+  readonly provider: string | null;
+  readonly model: string | null;
+  readonly status: string | null;
+  readonly cost_usd: number | null;
+  readonly tokens_in: number | null;
+  readonly tokens_out: number | null;
+  readonly started_at: string | null;
+  readonly finished_at: string | null;
+  readonly outcome: string;
+  readonly path: string;
+}
+
+export interface QueueRun {
+  readonly id: number;
+  readonly project_id: number;
+  readonly task_num: number;
+  readonly phase: string;
+  readonly provider: string;
+  readonly model: string;
+  readonly prompt: string | null;
+  readonly status: "queued" | "running" | "succeeded" | "failed" | "cancelled" | "interrupted";
+  readonly exit_code: number | null;
+  readonly log_path: string | null;
+  readonly cost_usd: number | null;
+  readonly tokens_in: number | null;
+  readonly tokens_out: number | null;
+  readonly created_at: string;
+  readonly started_at: string | null;
+  readonly finished_at: string | null;
+}
+
+export async function createComment(
+  project: string,
+  taskId: number,
+  input: { author?: string; body: string },
+): Promise<Comment[]> {
+  const body = await sendJson<{ comments: Comment[] }>(
+    `/api/projects/${project}/tasks/${taskId}/comments`,
+    "POST",
+    input,
+  );
+  return body.comments;
+}
+
+export async function fetchTaskDetails(
+  project: string,
+  taskId: number,
+): Promise<{ task: Task; comments: Comment[]; runs: TaskRun[]; queueRuns: QueueRun[] }> {
+  return getJson<{ task: Task; comments: Comment[]; runs: TaskRun[]; queueRuns: QueueRun[] }>(
+    `/api/projects/${project}/tasks/${taskId}`,
+  );
+}
+
+export async function createRun(
+  project: string,
+  taskId: number,
+  input: { phase: string; provider: string; model: string; prompt?: string },
+): Promise<QueueRun> {
+  const body = await sendJson<{ run: QueueRun }>(
+    `/api/projects/${project}/tasks/${taskId}/runs`,
+    "POST",
+    input,
+  );
+  return body.run;
+}
+
+export async function stopRun(runId: number): Promise<boolean> {
+  const response = await fetch(`/api/runs/${runId}/stop`, { method: "POST" });
+  if (!response.ok) {
+    throw new Error(`Stop run responded ${response.status}`);
+  }
+  const body = (await response.json()) as { stopped: boolean };
+  return body.stopped;
+}

@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import Fastify, { type FastifyInstance } from "fastify";
+import { existsSync, readFileSync } from "node:fs";
 import {
   addComment,
   createTask,
@@ -16,6 +17,7 @@ import {
 } from "@pm/core";
 import { reindexTask } from "./indexer/index.js";
 import type { RunnerRegistry } from "./runners/registry.js";
+import { QueueManager, sseEmitter, activeRunnerRunIds, callProjectctl } from "./queue.js";
 
 export interface AppContext {
   readonly db: Database.Database;
@@ -109,6 +111,9 @@ export function buildApp(ctx: AppContext): FastifyInstance {
   const app = Fastify({ logger: false });
   const { db, runners } = ctx;
 
+  const queueManager = new QueueManager(db, runners);
+  queueManager.init();
+
   // application/json and text/plain already have built-in parsers; this is
   // the fallback for attachment uploads (images, arbitrary files).
   app.addContentTypeParser("*", { parseAs: "buffer" }, (_request, body, done) => {
@@ -180,7 +185,10 @@ export function buildApp(ctx: AppContext): FastifyInstance {
     const runs = db
       .prepare("SELECT * FROM task_runs WHERE project_id = ? AND task_num = ? ORDER BY run_num")
       .all(project.id, num);
-    return { task: serializeTask(task), comments, runs };
+    const queueRuns = db
+      .prepare("SELECT * FROM runs WHERE project_id = ? AND task_num = ? ORDER BY id")
+      .all(project.id, num);
+    return { task: serializeTask(task), comments, runs, queueRuns };
   });
 
   app.post("/api/projects/:name/tasks", async (request, reply) => {
@@ -327,6 +335,138 @@ export function buildApp(ctx: AppContext): FastifyInstance {
     } catch {
       return reply.code(404).send({ error: "attachment_not_found" });
     }
+  });
+
+  app.get("/api/projects/:name/tasks/:taskNum/runs", async (request, reply) => {
+    const { name, taskNum } = request.params as { name: string; taskNum: string };
+    const project = getProjectRow(name);
+    if (!project) return reply.code(404).send({ error: "project_not_found" });
+    const num = Number(taskNum);
+    const runs = db.prepare("SELECT * FROM runs WHERE project_id = ? AND task_num = ? ORDER BY id").all(project.id, num);
+    return { runs };
+  });
+
+  app.post("/api/projects/:name/tasks/:taskNum/runs", async (request, reply) => {
+    const { name, taskNum } = request.params as { name: string; taskNum: string };
+    const project = getProjectRow(name);
+    if (!project) return reply.code(404).send({ error: "project_not_found" });
+    const num = Number(taskNum);
+    const task = getTaskRow(project.id, num);
+    if (!task) return reply.code(404).send({ error: "task_not_found" });
+
+    const body = request.body as { phase?: string; provider?: string; model?: string; prompt?: string };
+    if (!body.phase || !body.provider || !body.model) {
+      return reply.code(400).send({ error: "phase_provider_model_required" });
+    }
+
+    const result = db.prepare(
+      "INSERT INTO runs (project_id, task_num, phase, provider, model, prompt, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)"
+    ).run(
+      project.id,
+      num,
+      body.phase,
+      body.provider,
+      body.model,
+      body.prompt || null,
+      new Date().toISOString()
+    );
+
+    queueManager.trigger();
+
+    const run = db.prepare("SELECT * FROM runs WHERE id = ?").get(result.lastInsertRowid);
+    return reply.code(201).send({ run });
+  });
+
+  app.post("/api/runs/:id/stop", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const run = db.prepare("SELECT * FROM runs WHERE id = ?").get(Number(id)) as any;
+    if (!run) return reply.code(404).send({ error: "run_not_found" });
+    if (run.status !== "running" && run.status !== "queued") {
+      return reply.code(409).send({ error: "run_not_active" });
+    }
+
+    if (run.status === "queued") {
+      db.prepare("UPDATE runs SET status = 'cancelled', finished_at = ? WHERE id = ?").run(new Date().toISOString(), run.id);
+      return { stopped: true };
+    }
+
+    const project = db.prepare("SELECT * FROM projects WHERE id = ?").get(run.project_id) as any;
+    const client = runners.client(project.name);
+    if (!client) return reply.code(409).send({ error: "runner_not_connected" });
+
+    const runnerRunId = activeRunnerRunIds.get(run.id);
+    if (runnerRunId === undefined) {
+      return reply.code(409).send({ error: "run_not_started_on_runner" });
+    }
+
+    const stopResult = await client.call("stopRun", { runId: runnerRunId });
+    if (stopResult.stopped) {
+      db.prepare("UPDATE runs SET status = 'cancelled', finished_at = ? WHERE id = ?").run(new Date().toISOString(), run.id);
+    }
+    return { stopped: stopResult.stopped };
+  });
+
+  app.get("/api/runs/:id/events", (request, reply) => {
+    const { id } = request.params as { id: string };
+    const runId = Number(id);
+    const run = db.prepare("SELECT * FROM runs WHERE id = ?").get(runId) as any;
+    if (!run) {
+      reply.code(404).send({ error: "run_not_found" });
+      return;
+    }
+
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+    });
+    reply.raw.write(":\n\n");
+
+    if (run.status !== "running" && run.status !== "queued") {
+      if (run.log_path && existsSync(run.log_path)) {
+        try {
+          const content = readFileSync(run.log_path, "utf8");
+          const lines = content.split("\n").filter(Boolean);
+          for (const line of lines) {
+            reply.raw.write(`data: ${JSON.stringify({ type: "log", runId, line })}\n\n`);
+          }
+        } catch (err) {
+          console.error("error reading log file:", err);
+        }
+      }
+      reply.raw.write(`data: ${JSON.stringify({ type: "end", runId })}\n\n`);
+      reply.raw.end();
+      return;
+    }
+
+    if (run.log_path && existsSync(run.log_path)) {
+      try {
+        const content = readFileSync(run.log_path, "utf8");
+        const lines = content.split("\n").filter(Boolean);
+        for (const line of lines) {
+          reply.raw.write(`data: ${JSON.stringify({ type: "log", runId, line })}\n\n`);
+        }
+      } catch (err) {
+        // ignore
+      }
+    }
+
+    const onLine = (line: string) => {
+      reply.raw.write(`data: ${JSON.stringify({ type: "log", runId, line })}\n\n`);
+    };
+
+    const onEnd = () => {
+      reply.raw.write(`data: ${JSON.stringify({ type: "end", runId })}\n\n`);
+      reply.raw.end();
+    };
+
+    sseEmitter.on(`run-${runId}`, onLine);
+    sseEmitter.once(`run-${runId}-end`, onEnd);
+
+    request.raw.on("close", () => {
+      sseEmitter.off(`run-${runId}`, onLine);
+      sseEmitter.off(`run-${runId}-end`, onEnd);
+    });
   });
 
   return app;

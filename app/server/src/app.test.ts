@@ -244,3 +244,60 @@ test("attachment routes 404 for an unknown task", () =>
     });
     assert.equal(download.statusCode, 404);
   }));
+
+test("runs queue endpoints create, list, and stop queued runs", () =>
+  withApp(async ({ app }) => {
+    const created = await createTaskViaApi(app, { title: "Test task", description: "desc" });
+    const taskNum = created.task.id;
+
+    // Create a run
+    const createRes = await app.inject({
+      method: "POST",
+      url: `/api/projects/demo/tasks/${taskNum}/runs`,
+      payload: {
+        phase: "implement",
+        provider: "claude",
+        model: "claude-3-5-sonnet-latest",
+        prompt: "hello test",
+      },
+    });
+    assert.equal(createRes.statusCode, 201);
+    const run = createRes.json().run;
+    assert.equal(run.status, "queued");
+    assert.equal(run.prompt, "hello test");
+
+    // List runs
+    const listRes = await app.inject({
+      method: "GET",
+      url: `/api/projects/demo/tasks/${taskNum}/runs`,
+    });
+    assert.equal(listRes.statusCode, 200);
+    const runsList = listRes.json().runs;
+    assert.equal(runsList.length, 1);
+    assert.equal(runsList[0].id, run.id);
+
+    // Get task details to verify queueRuns is present
+    const detailsRes = await app.inject({
+      method: "GET",
+      url: `/api/projects/demo/tasks/${taskNum}`,
+    });
+    assert.equal(detailsRes.statusCode, 200);
+    const details = detailsRes.json();
+    assert.equal(details.queueRuns.length, 1);
+    assert.equal(details.queueRuns[0].id, run.id);
+
+    // Stop / cancel the queued run
+    const stopRes = await app.inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/stop`,
+    });
+    assert.equal(stopRes.statusCode, 200);
+    assert.equal(stopRes.json().stopped, true);
+
+    // Verify it is cancelled
+    const listResAfter = await app.inject({
+      method: "GET",
+      url: `/api/projects/demo/tasks/${taskNum}/runs`,
+    });
+    assert.equal(listResAfter.json().runs[0].status, "cancelled");
+  }));
