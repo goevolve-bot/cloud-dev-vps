@@ -158,6 +158,18 @@ class ProvisioningTests(unittest.TestCase):
         self.assertIn(".pm/tasks/todo/.gitkeep", listing)
         self.assertIn(".pm/adrs/.gitkeep", listing)
 
+        # pm (in group `pm`, not the project's own private group) must be
+        # able to write directly into .pm/, not just read it.
+        pm_dir = os.path.join(dest, ".pm")
+        self.assertEqual(self._mode(pm_dir), 0o2770)
+        self.assertEqual(self._group_of(pm_dir), self.group)
+        todo_dir = os.path.join(pm_dir, "tasks", "todo")
+        self.assertEqual(self._mode(todo_dir), 0o2770)
+        self.assertEqual(self._group_of(todo_dir), self.group)
+        readme = os.path.join(pm_dir, "README.md")
+        self.assertEqual(self._mode(readme), 0o660)
+        self.assertEqual(self._group_of(readme), self.group)
+
         # Re-running create must not clone twice or commit an empty change.
         self.assertEqual(ctl.clone_repo(self.cfg, self.pw, "file://" + remote), (dest, None))
         self.assertEqual(

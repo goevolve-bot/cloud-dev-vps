@@ -817,6 +817,37 @@ def clone_repo(cfg: Config, pw: "pwd.struct_passwd", url: str) -> Tuple[str, Opt
 # --------------------------------------------------------------------------
 
 
+def secure_pm_tree_for_shared_write(pm_dir: str, uid: int, gid: int) -> None:
+    """Own `.pm/` by the project user, but grant the `pm` group real write
+    access too, not just read.
+
+    This runs (as root) right after `os.makedirs`/`open` created the tree, so
+    everything in it is still root-owned; the project user needs full access
+    since it does `git add`/`commit`/`push` here as itself, and pm (a
+    different uid, member only of the shared `pm` group) writes task/comment/
+    run files directly into `.pm/` (see docs/pm-system-plan.md) — only git
+    commit/push is delegated to the runner. Setgid on every directory makes
+    anything created later (by pm, or by an agent run as the project user)
+    inherit the `pm` group and its write bit too, so this only needs to run
+    once, at scaffold time.
+    """
+    os.chown(pm_dir, uid, gid)
+    os.chmod(pm_dir, 0o2770)
+    for root, dirs, files in os.walk(pm_dir):
+        for name in dirs:
+            path = os.path.join(root, name)
+            if os.path.islink(path):
+                continue
+            os.chown(path, uid, gid)
+            os.chmod(path, 0o2770)
+        for name in files:
+            path = os.path.join(root, name)
+            if os.path.islink(path):
+                continue
+            os.chown(path, uid, gid)
+            os.chmod(path, 0o660)
+
+
 def scaffold_pm_tree(cfg: Config, pw: "pwd.struct_passwd", repo_dir: str) -> Dict[str, Any]:
     """Create `.pm/` and commit it on the default branch if the repo lacks one.
 
@@ -833,7 +864,7 @@ def scaffold_pm_tree(cfg: Config, pw: "pwd.struct_passwd", repo_dir: str) -> Dic
             pass
     with open(os.path.join(pm_dir, "README.md"), "w", encoding="utf-8") as handle:
         handle.write(PM_SCAFFOLD_README)
-    chown_tree(pm_dir, pw.pw_uid, pw.pw_gid)
+    secure_pm_tree_for_shared_write(pm_dir, pw.pw_uid, pm_gid(cfg))
 
     env = git_env(pw)
     for key, value in (("user.name", cfg.git_user_name), ("user.email", cfg.git_user_email)):
