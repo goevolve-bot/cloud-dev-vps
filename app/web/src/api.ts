@@ -82,3 +82,39 @@ export async function updateTask(
   );
   return body.task;
 }
+
+export function attachmentUrl(project: string, taskId: number, filename: string): string {
+  return `/api/projects/${project}/tasks/${taskId}/attachments/${encodeURIComponent(filename)}`;
+}
+
+export async function fetchAttachments(project: string, taskId: number): Promise<string[]> {
+  const body = await getJson<{ attachments: string[] }>(
+    `/api/projects/${project}/tasks/${taskId}/attachments`,
+  );
+  return body.attachments;
+}
+
+export interface UploadAttachmentInput {
+  /** Omit for a clipboard paste — the server picks a pasted-NN name. */
+  readonly filename?: string;
+  readonly contentType: string;
+  readonly data: Blob | string;
+}
+
+export async function uploadAttachment(
+  project: string,
+  taskId: number,
+  input: UploadAttachmentInput,
+): Promise<string> {
+  const query = input.filename ? `?filename=${encodeURIComponent(input.filename)}` : "";
+  const response = await fetch(`/api/projects/${project}/tasks/${taskId}/attachments${query}`, {
+    method: "POST",
+    headers: { "content-type": input.contentType },
+    body: input.data,
+  });
+  if (!response.ok) {
+    throw new Error(`upload attachment responded ${response.status}`);
+  }
+  const body = (await response.json()) as { filename: string };
+  return body.filename;
+}

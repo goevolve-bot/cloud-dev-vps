@@ -5,8 +5,12 @@ import {
   createTask,
   findTask,
   isTaskStatus,
+  listAttachments,
   moveTaskStatus,
+  nextPastedName,
   pmDirFor,
+  readAttachment,
+  writeAttachment,
   writeTaskDescription,
   type TaskStatus,
 } from "@pm/core";
@@ -71,9 +75,45 @@ function serializeTask(row: TaskRow) {
   };
 }
 
+const EXT_TO_MIME: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  svg: "image/svg+xml",
+  md: "text/markdown",
+  txt: "text/plain",
+  pdf: "application/pdf",
+};
+
+function mimeFor(filename: string): string {
+  const ext = filename.split(".").pop()?.toLowerCase() ?? "";
+  return EXT_TO_MIME[ext] ?? "application/octet-stream";
+}
+
+function extFor(mimeType: string): string {
+  const found = Object.entries(EXT_TO_MIME).find(([, mime]) => mime === mimeType);
+  return found?.[0] ?? "bin";
+}
+
+// A single path segment, no separators — closes off traversal outside the
+// task's attachments/ directory regardless of what @pm/core does with it.
+const SAFE_FILENAME_RE = /^[^/\\]+$/;
+
+function isSafeFilename(name: string): boolean {
+  return SAFE_FILENAME_RE.test(name) && name !== "." && name !== ".." && !name.includes("\0");
+}
+
 export function buildApp(ctx: AppContext): FastifyInstance {
   const app = Fastify({ logger: false });
   const { db, runners } = ctx;
+
+  // application/json and text/plain already have built-in parsers; this is
+  // the fallback for attachment uploads (images, arbitrary files).
+  app.addContentTypeParser("*", { parseAs: "buffer" }, (_request, body, done) => {
+    done(null, body);
+  });
 
   function getProjectRow(name: string): ProjectRow | undefined {
     return db.prepare("SELECT * FROM projects WHERE name = ?").get(name) as ProjectRow | undefined;
@@ -218,6 +258,75 @@ export function buildApp(ctx: AppContext): FastifyInstance {
       .prepare("SELECT * FROM comments WHERE project_id = ? AND task_num = ? ORDER BY comment_num")
       .all(project.id, num);
     return reply.code(201).send({ comments, pushed });
+  });
+
+  app.get("/api/projects/:name/tasks/:taskNum/attachments", async (request, reply) => {
+    const { name, taskNum } = request.params as { name: string; taskNum: string };
+    const project = getProjectRow(name);
+    if (!project) return reply.code(404).send({ error: "project_not_found" });
+    if (!project.repo_dir) return reply.code(409).send({ error: "project_has_no_repo" });
+    const pmDir = pmDirFor(project.repo_dir);
+
+    const task = await findTask(pmDir, Number(taskNum));
+    if (!task) return reply.code(404).send({ error: "task_not_found" });
+
+    return { attachments: await listAttachments(task) };
+  });
+
+  app.post("/api/projects/:name/tasks/:taskNum/attachments", async (request, reply) => {
+    const { name, taskNum } = request.params as { name: string; taskNum: string };
+    const project = getProjectRow(name);
+    if (!project) return reply.code(404).send({ error: "project_not_found" });
+    if (!project.repo_dir) return reply.code(409).send({ error: "project_has_no_repo" });
+    const pmDir = pmDirFor(project.repo_dir);
+
+    const task = await findTask(pmDir, Number(taskNum));
+    if (!task) return reply.code(404).send({ error: "task_not_found" });
+
+    const query = request.query as { filename?: string };
+    let filename = query.filename;
+    if (filename !== undefined && !isSafeFilename(filename)) {
+      return reply.code(400).send({ error: "invalid_filename" });
+    }
+    if (!filename) {
+      // Clipboard paste, no explicit name: mirror Claude chats' pasted-NN
+      // convention, extension driven by what was actually pasted.
+      const contentType = request.headers["content-type"] ?? "";
+      const ext = contentType.startsWith("text/")
+        ? "md"
+        : extFor(contentType.split(";")[0]?.trim() ?? "");
+      filename = await nextPastedName(task, { ext });
+    }
+
+    const data = request.body;
+    if (typeof data !== "string" && !Buffer.isBuffer(data)) {
+      return reply.code(400).send({ error: "body_required" });
+    }
+    await writeAttachment(task, filename, data);
+    return reply.code(201).send({ filename });
+  });
+
+  app.get("/api/projects/:name/tasks/:taskNum/attachments/:filename", async (request, reply) => {
+    const { name, taskNum, filename } = request.params as {
+      name: string;
+      taskNum: string;
+      filename: string;
+    };
+    if (!isSafeFilename(filename)) return reply.code(400).send({ error: "invalid_filename" });
+    const project = getProjectRow(name);
+    if (!project) return reply.code(404).send({ error: "project_not_found" });
+    if (!project.repo_dir) return reply.code(409).send({ error: "project_has_no_repo" });
+    const pmDir = pmDirFor(project.repo_dir);
+
+    const task = await findTask(pmDir, Number(taskNum));
+    if (!task) return reply.code(404).send({ error: "task_not_found" });
+
+    try {
+      const data = await readAttachment(task, filename);
+      return reply.type(mimeFor(filename)).send(data);
+    } catch {
+      return reply.code(404).send({ error: "attachment_not_found" });
+    }
   });
 
   return app;

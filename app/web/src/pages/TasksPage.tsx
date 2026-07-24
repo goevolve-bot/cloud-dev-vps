@@ -56,6 +56,7 @@ export function TasksPage({ project }: TasksPageProps) {
       {selected ? (
         <TaskView
           task={selected}
+          project={project}
           onSave={handleSaveDescription}
           onStatusChange={handleStatusChange}
         />

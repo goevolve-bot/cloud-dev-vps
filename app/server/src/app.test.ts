@@ -158,3 +158,89 @@ test("comment routes 404 for an unknown project without touching disk", () =>
     });
     assert.equal(response.statusCode, 404);
   }));
+
+test("uploading an attachment with an explicit filename writes it under the task folder", () =>
+  withApp(async ({ app, repoDir }) => {
+    const created = await createTaskViaApi(app, { title: "A", description: "d" });
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+    const upload = await app.inject({
+      method: "POST",
+      url: `/api/projects/demo/tasks/${created.task.id}/attachments?filename=screenshot.png`,
+      headers: { "content-type": "image/png" },
+      payload: png,
+    });
+    assert.equal(upload.statusCode, 201);
+    assert.equal(upload.json().filename, "screenshot.png");
+
+    const list = await app.inject({
+      method: "GET",
+      url: `/api/projects/demo/tasks/${created.task.id}/attachments`,
+    });
+    assert.deepEqual(list.json().attachments, ["screenshot.png"]);
+
+    const onDisk = await readFile(
+      join(repoDir, ".pm", "tasks", "todo", "0001-a", "attachments", "screenshot.png"),
+    );
+    assert.deepEqual(onDisk, png);
+
+    const download = await app.inject({
+      method: "GET",
+      url: `/api/projects/demo/tasks/${created.task.id}/attachments/screenshot.png`,
+    });
+    assert.equal(download.statusCode, 200);
+    assert.equal(download.headers["content-type"], "image/png");
+    assert.deepEqual(download.rawPayload, png);
+  }));
+
+test("a clipboard paste with no filename gets a pasted-NN name from its content type", () =>
+  withApp(async ({ app }) => {
+    const created = await createTaskViaApi(app, { title: "A", description: "d" });
+
+    const textPaste = await app.inject({
+      method: "POST",
+      url: `/api/projects/demo/tasks/${created.task.id}/attachments`,
+      headers: { "content-type": "text/plain" },
+      payload: "a".repeat(2000),
+    });
+    assert.equal(textPaste.statusCode, 201);
+    assert.equal(textPaste.json().filename, "pasted-0001.md");
+
+    const imagePaste = await app.inject({
+      method: "POST",
+      url: `/api/projects/demo/tasks/${created.task.id}/attachments`,
+      headers: { "content-type": "image/png" },
+      payload: Buffer.from([1, 2, 3]),
+    });
+    assert.equal(imagePaste.statusCode, 201);
+    // Numbering is scoped per extension, so the first .png paste is 0001
+    // even though a .md paste already exists.
+    assert.equal(imagePaste.json().filename, "pasted-0001.png");
+  }));
+
+test("attachment uploads reject a path-traversal filename", () =>
+  withApp(async ({ app }) => {
+    const created = await createTaskViaApi(app, { title: "A", description: "d" });
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/projects/demo/tasks/${created.task.id}/attachments?filename=${encodeURIComponent("../../evil")}`,
+      headers: { "content-type": "text/plain" },
+      payload: "x",
+    });
+    assert.equal(response.statusCode, 400);
+  }));
+
+test("attachment routes 404 for an unknown task", () =>
+  withApp(async ({ app }) => {
+    const list = await app.inject({
+      method: "GET",
+      url: "/api/projects/demo/tasks/999/attachments",
+    });
+    assert.equal(list.statusCode, 404);
+
+    const download = await app.inject({
+      method: "GET",
+      url: "/api/projects/demo/tasks/999/attachments/x.png",
+    });
+    assert.equal(download.statusCode, 404);
+  }));
