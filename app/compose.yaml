@@ -1,0 +1,68 @@
+services:
+  # One-shot: generate a self-signed origin cert into a shared volume if one
+  # isn't there yet. Cloudflare terminates public TLS and proxies to this
+  # origin in Full (strict) mode — see docs/pm-system-plan.md.
+  cert-init:
+    image: alpine:3.20
+    volumes:
+      - certs:/certs
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        if [ ! -f /certs/origin.crt ]; then
+          apk add --no-cache openssl >/dev/null
+          openssl req -x509 -nodes -newkey rsa:2048 \
+            -keyout /certs/origin.key -out /certs/origin.crt \
+            -days 3650 -subj "/CN=pm.local"
+        fi
+
+  # One-shot: generate the basic-auth htpasswd file if one isn't there yet.
+  # Dev-only defaults below; the real deploy renders this from a vaulted
+  # Ansible var (roles/pm, T40) instead.
+  auth-init:
+    image: httpd:2.4-alpine
+    volumes:
+      - auth:/auth
+    environment:
+      PM_AUTH_USER: "${PM_AUTH_USER:-admin}"
+      PM_AUTH_PASSWORD: "${PM_AUTH_PASSWORD:-changeme}"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        if [ ! -f /auth/htpasswd ]; then
+          htpasswd -bc /auth/htpasswd "$$PM_AUTH_USER" "$$PM_AUTH_PASSWORD"
+        fi
+
+  pm:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    restart: unless-stopped
+    expose:
+      - "3000"
+    environment:
+      PORT: "3000"
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+      auth-init:
+        condition: service_completed_successfully
+      pm:
+        condition: service_started
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - certs:/etc/nginx/certs:ro
+      - auth:/etc/nginx/auth:ro
+    ports:
+      - "80:80"
+      - "443:443"
+
+volumes:
+  certs:
+  auth:
