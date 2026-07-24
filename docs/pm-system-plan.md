@@ -31,8 +31,8 @@ the project's own Docker environment.
 
 ## Project contract
 
-The contract is **convention over configuration** — Compose can express nearly
-everything the system needs, so most projects require zero PM-specific files:
+The contract is **pure convention** — Compose expresses everything the system
+needs, so a compliant project carries **no PM-specific config file at all**:
 
 1. **`Dockerfile`** — builds the project.
 2. **`compose.yaml`** (or `docker-compose.yml`) — runs the full environment
@@ -43,8 +43,11 @@ everything the system needs, so most projects require zero PM-specific files:
    them (`docker compose run --rm test`, then `e2e`). A project with an `e2e`
    service counts as a UI project and must write screenshots/videos to
    `./pm-artifacts/`.
-4. **`pm.yml`** — *optional* override, only for repos that can't follow the
-   convention (different compose filename, service names, artifacts dir).
+
+Everything is a fixed name (`compose.yaml`/`docker-compose.yml`, services
+`test` / `e2e`, artifacts dir `./pm-artifacts/`). No `pm.yml`, no overrides — a
+project either follows the convention or an implement run makes it follow the
+convention. Keeping it rigid is the point: nothing to learn, nothing to parse.
 
 **UI projects must have e2e tests** (Playwright is the recommended standard —
 it natively produces screenshots and videos); the system surfaces the
@@ -160,12 +163,18 @@ a strictly validated verb set:
   volume and image store is a separate explicit flag. The UI requires typed
   confirmation and offers "remove but keep data" vs "purge".
 
-Project names are validated (`[a-z0-9-]`, must exist for start/stop/delete);
-git URLs are passed to git only, never a shell. `create`/`delete` widen the
-root-touching surface compared to a manual host script — accepted trade-off
-for having the whole project onboarding flow in the UI; the helper stays
-small enough to audit in one sitting, and a CLI invocation over SSH remains
-possible for the paranoid path.
+Project names are validated (`[a-z0-9-]`, must exist for start/stop/delete).
+The git URL is handled safely against command injection: the helper never
+builds a shell string like `sh -c "git clone $url"` (where a URL of
+`https://x;rm -rf ~` would run `rm`). Instead it `execve`s git directly with an
+argv array — `["git","clone","--",url,dest]` — so the URL is a single opaque
+argument git parses itself, never tokens the shell interprets; the leading `--`
+also stops a `-`-prefixed URL from being read as a git flag. The scheme is
+allow-listed (`https://`, `git@`/`ssh://`) before that. `create`/`delete` widen
+the root-touching surface compared to a manual host script — accepted
+trade-off for UI-driven onboarding; the helper stays small enough to audit in
+one sitting, and a CLI invocation over SSH remains possible for the paranoid
+path.
 
 Rootless Docker can't bind ports <1024 by default; Ansible sets
 `net.ipv4.ip_unprivileged_port_start=80` so nginx (on the pm daemon) can
@@ -186,6 +195,23 @@ Verify auto-runs after every successful implement run (and can be re-run
 manually). Its failures are formatted and fed into the next implement prompt.
 Non-implement agent phases carry a "do not modify files" instruction and the
 workspace is reset afterwards.
+
+**Nothing auto-launches implement.** The only automatic chaining is
+implement → verify (a deterministic check, no agent, no code changes). Review
+never triggers implement: it *produces findings* and moves the task to
+**ready for review**, then stops. Every implement run is an explicit human
+launch. So the loop is human-gated at two points:
+
+- **Acceptance** is the human gate. `ready for review` → **done** happens only
+  when you click **Accept** (or you kick it back with a comment / a new
+  implement run). The agent Review phase is advisory input to *your* decision,
+  not an actor that closes or re-opens work.
+- Concretely: implement finishes → verify runs → task lands in `ready for
+  review` with the diff, verify artifacts, and (if you ran it) review findings
+  all visible. You then Accept → done, or launch another implement iteration.
+  Optionally a project can enable "auto-run review when entering ready for
+  review" so findings are waiting for you — but they remain advisory; the
+  Accept click is always yours.
 
 ## Repo-stored knowledge: tasks, specs, ADRs
 
@@ -252,15 +278,25 @@ Two processes per project + one central app:
 ### Data model (SQLite — cache + runtime only; `.pm/` in the repo is truth)
 
 - `projects` — id, name, runner_socket, git_url, default_provider,
-  default_model, contract (resolved convention + optional pm.yml overrides,
-  compliance state), lifecycle state, always_on
+  default_model, contract (resolved convention + compliance state), lifecycle
+  state, always_on
 - `tasks`, `comments`, `task_runs` — parsed cache of `.pm/` for fast list,
   search, and rendering; rebuilt from the repo at any time
 - `runs` (runtime) — id, task_id, phase, provider, model, prompt, status
   (`queued/running/succeeded/failed/cancelled/interrupted`), exit_code,
-  started/finished, log_path (JSONL in pm data dir), artifacts_dir; on
-  completion pm writes the durable outcome to `.pm/tasks/…/runs/NNNN.md`
+  started/finished, log_path (JSONL in pm data dir), artifacts_dir,
+  **cost_usd + tokens_in/out** (parsed from the provider's session summary —
+  e.g. Claude's final `total_cost_usd`); on completion pm writes the durable
+  outcome (including cost) to `.pm/tasks/…/runs/NNNN.md`
 - `questions` — id, task_id, run_id, text, answer, answered_at
+
+**Cost roll-ups.** Each run's cost is captured from the provider's own session
+report (Claude returns it in the stream-json result; the adapter's
+`extractCost` normalizes per provider). The UI shows cost at three levels:
+per **run** (in the timeline chip), per **task** (sum of its runs, in the task
+header), and per **project** (sum of all tasks, in the project view) — plus a
+month-to-date figure. Costs live in the run's `.pm/` file so the totals survive
+a cache rebuild and are auditable in git.
 
 ### Git flow (host-agnostic)
 
@@ -274,11 +310,24 @@ pm never holds the key and never runs git for a project.
 3. After a successful implement run, the runner's `commitAndPush` pushes the
    branch with the deploy key. Works for GitHub, GitLab, Gitea, bare SSH
    remotes — no forge API, no gh CLI.
-4. `.pm/` writes (task moves, comments, run outcomes) are staged by pm into the
-   group-readable working tree, then committed+pushed to the **default branch**
-   by the runner. Verify/review check the pushed task branch out into a
-   **separate fresh volume** so they test what was delivered, not a dirty
-   workspace.
+4. `.pm/` writes (task moves, comments, run outcomes) go to the **default
+   branch** — never onto task branches. To avoid any worktree juggling, the
+   runner keeps **one long-lived checkout pinned to the default branch** used
+   *only* for `.pm/` (its group-readable working tree is where pm stages
+   files); code task branches live in separate per-task workspaces. The two
+   never share a working tree, so there is nothing to orchestrate — a `.pm/`
+   commit and an agent's code commit can't collide.
+5. Verify/review check the pushed task branch out into a **separate fresh
+   volume** so they test what was delivered, not a dirty workspace.
+
+**Why `.pm/` on the default branch, not the task branch** (raised in review):
+task metadata must be globally true — the board, cost totals, and history can't
+depend on which unmerged branch you're looking at, and a `todo` task has no
+branch yet. Putting `.pm/` on task branches would scatter the board across
+branches and force a merge before any task's state is visible. The cost of
+keeping it central is exactly one extra pinned checkout in the runner (above) —
+cheaper than the cross-branch reconciliation the alternative needs. So: `.pm/`
+central on default; code isolated on task branches.
 
 ### Provider adapters
 
@@ -287,15 +336,35 @@ interface ProviderAdapter {
   containerCmd(opts: { prompt: string; model: string }): string[]; // argv inside pm-agent image
   parseEvents(stdout: Readable): AsyncIterable<RunEvent>;
   extractOutcome(events: RunEvent[]): string;
+  extractCost(events: RunEvent[]): { usd: number; tokensIn: number; tokensOut: number } | null;
+  models(): Promise<Model[]>; // for the UI provider/model dropdowns
 }
 ```
 
 - **claude**: `claude -p "<prompt>" --model <model> --output-format stream-json
-  --verbose --dangerously-skip-permissions`.
+  --verbose --dangerously-skip-permissions`; `extractCost` reads
+  `total_cost_usd` / token usage from the final result event.
 - **antigravity**: exact unattended flags to be verified via `agy --help` on
   the VPS when the adapter is built; the interface isolates this.
 
 Prompt templates per phase live in `app/server/prompts/` as plain text.
+
+### Provider setup (via UI, not config files)
+
+Providers are configured in a **Settings → Providers** screen, not seeded by
+Ansible. Each provider row shows connection status and offers **Connect**:
+
+- OAuth providers (Claude, Antigravity) run a device/login flow; the resulting
+  token is written straight into each project user's private `~/.pm-creds`
+  (0600) by `pm-projectctl set-credential`, and re-seeded to new projects on
+  create. The pm app only ever stores a masked status (`connected`, account
+  label, expiry) — never the token, consistent with the isolation model.
+- API-key providers accept a pasted key through the same one-way path (UI →
+  `pm-projectctl` → project users), and pm keeps only a masked reference.
+
+The screen also lets you pick which models appear in the launch-bar dropdowns
+(from each adapter's `models()`), and set the default provider/model per
+project.
 
 ## Web UI
 
@@ -306,20 +375,26 @@ for content. Wireframe: `docs/pm-ui-wireframe.html` (v1, agreed layout).
   two-step modal driving `pm-projectctl create`, showing the deploy pubkey and
   waiting for confirmation); tabs **Tasks / Specs / ADRs**; search over the
   cached index of the current project; daemon state badge
-  (`active / idle / stopped`, click to toggle, "always on" pin); logout.
+  (`active / idle / stopped`, click to toggle, "always on" pin); a
+  **project cost** figure (MTD); a **Settings** menu (Providers, project
+  defaults); logout.
 - **Left sidebar (Tasks)** — task list grouped by status folder
   (todo / in progress / ready for review / done / blocked), collapsible
   groups, live dot on tasks with a running agent, "+ new task".
-- **Main area (task)** — title + status select + branch chip; launch bar
+- **Main area (task)** — title + status select + branch chip + **task-cost
+  chip**; an **Accept** button on `ready for review` tasks (→ done); launch bar
   (phase × provider × model × Run, plus quick-launch buttons per phase);
   markdown description with clipboard handling — pasted image → attachment,
   large text paste → `pasted-NN.md` attachment (as in Claude chats), explicit
   attach button — all stored under the task folder in the repo; **timeline**
-  mixing status changes, comments (composer pinned at bottom), and runs —
-  running ones tail logs live via SSE with a stop button, finished ones render
-  the outcome md, verify entries show the **artifacts gallery** (screenshot
-  thumbnails, GIF/video playback, lightbox); interview runs render the answer
-  form inline.
+  mixing status changes, comments (composer pinned at bottom), and runs — each
+  run chip shows its **cost**; running ones tail logs live via SSE with a stop
+  button, finished ones render the outcome md, verify entries show the
+  **artifacts gallery** (screenshot thumbnails, GIF/video playback, lightbox);
+  interview runs render the answer form inline.
+- **Settings → Providers** — connect Claude / Antigravity (OAuth or API key),
+  see connection status, choose which models populate the launch-bar dropdowns,
+  set per-project default provider/model.
 - **Specs / ADRs tabs** — file list left (ADRs with status chips; abandoned
   kept and struck through), rendered markdown right, per-file git history
   link.
@@ -333,8 +408,10 @@ app/
   server/          Fastify app: API, queue, adapters, prompts, migrations
   runner/          per-project runner: docker + git + secrets, narrow control API
   web/             React SPA (Vite)
-  agent-image/     Dockerfile for pm-agent (claude, agy, git, docker CLI — no
-                   project toolchains, so project code runs only in containers)
+  agent-image/     Dockerfile for pm-agent (claude, agy, git, docker CLI, and
+                   fast search/nav tooling: ripgrep, fd, jq, fzf, bat, delta —
+                   no project language toolchains, so project code runs only
+                   in containers)
   compose.yaml     pm + nginx stack
   nginx/           nginx conf template, htpasswd handling
   package.json     pnpm workspace root
@@ -351,12 +428,17 @@ roles/
   `app/` to the VPS; build `pm` + `pm-agent` images and bring up the compose
   stack as the `pm` user (systemd user unit wrapping `docker compose up -d`,
   linger enabled); set sysctl `net.ipv4.ip_unprivileged_port_start=80`; render
-  nginx conf + htpasswd from vaulted `pm_auth_password`; TLS certs in a
-  volume — certbot sidecar when `pm_domain` is set, self-signed fallback
-  otherwise; install the `pm-projectctl` helper service; store the provider
-  OAuth token where `pm-projectctl create` can seed it into each project
-  user's private `~/.pm-creds` (never into the `pm` app's reach).
-- **`roles/nftables`**: template gains 80/443 accept rules.
+  nginx conf + htpasswd from vaulted `pm_auth_password`; install the
+  `pm-projectctl` helper service. **No provider creds in Ansible** — providers
+  are connected from the UI (see Provider setup) after deploy.
+- **TLS: self-signed origin cert; Cloudflare terminates public TLS.** The
+  service sits behind Cloudflare, so nginx serves a self-signed origin
+  certificate (generated once into a volume) and Cloudflare is set to *Full
+  (strict)* against it — no certbot, no Let's Encrypt, no `pm_domain`
+  cert dance. Optionally lock the origin to Cloudflare's IP ranges + a
+  header/mTLS check at nginx.
+- **`roles/nftables`**: template gains 80/443 accept rules (optionally scoped
+  to Cloudflare IP ranges so the origin isn't reachable directly).
 - No host Node/nginx dependencies — the host needs only rootless Docker
   tooling, which the playbook already provides.
 
@@ -393,12 +475,22 @@ roles/
   key live 0600 in the project user's home, mounted only into the agent
   context — never into pm, never into project workload containers. Fallback to
   per-provider API keys stays open if concurrent OAuth refresh misbehaves.
-- Project contract is **convention-first** (compose healthchecks, `test`/`e2e`
-  services, `./pm-artifacts`), with `pm.yml` as an optional override only.
-- nginx basic auth (single user) is the only auth layer; the app trusts the
-  proxy. TLS needs `pm_domain` for Let's Encrypt; self-signed until then.
+- Project contract is **pure convention** (compose healthchecks, fixed-name
+  `test`/`e2e` services, `./pm-artifacts`) — no `pm.yml`, no overrides.
+- **Providers are set up in the UI**, not in Ansible; secrets flow one-way via
+  `pm-projectctl` into each project user's private creds, never into the pm
+  app.
+- **Per-run/task/project cost** is captured from each provider's session report
+  and shown in the timeline, task header, and project view (plus MTD).
+- **TLS is self-signed at the origin behind Cloudflare** (Full-strict); no
+  certbot/Let's Encrypt. nginx basic auth stays as a second factor; firewall
+  optionally scoped to Cloudflare IPs.
+- Agent image ships **fast tooling** (ripgrep, fd, jq, fzf, bat, delta) but no
+  project language toolchains.
 - Playwright is the recommended e2e standard; any tool works if it writes
   screenshots/videos to the declared artifacts dir.
+- **Review never auto-launches implement**; `ready for review` → `done` is a
+  human **Accept**. Agent review findings are advisory.
 - `.pm/` writes land on the **default branch**, committed+pushed by the runner
   (pm stages the files, the runner holds the key); audit trail is the git log;
   implementation branches never touch `.pm/`.
