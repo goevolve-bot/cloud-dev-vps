@@ -16,9 +16,11 @@ export interface ProviderAdapter {
 }
 
 import { ClaudeAdapter } from "./claude.js";
+import { AntigravityAdapter } from "./antigravity.js";
 
 const ADAPTERS: Record<string, ProviderAdapter> = {
   claude: new ClaudeAdapter(),
+  antigravity: new AntigravityAdapter(),
 };
 
 export function getAdapter(provider: string): ProviderAdapter {

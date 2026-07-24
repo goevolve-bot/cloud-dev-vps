@@ -61,6 +61,64 @@ export function callProjectctl(
 
 export const activeRunnerRunIds = new Map<number, number>();
 
+// ─── Idle-timeout watcher (T35) ──────────────────────────────────────────────
+// Default 30 minutes; override with PM_IDLE_TIMEOUT_MS env var.
+const IDLE_TIMEOUT_MS = Number(process.env.PM_IDLE_TIMEOUT_MS) || 30 * 60 * 1000;
+const idleTimers = new Map<number, ReturnType<typeof setTimeout>>();
+
+function scheduleIdleDeactivation(
+  db: Database.Database,
+  projectId: number,
+  projectName: string,
+): void {
+  // Cancel any existing timer for this project
+  const existing = idleTimers.get(projectId);
+  if (existing) clearTimeout(existing);
+
+  const timer = setTimeout(async () => {
+    idleTimers.delete(projectId);
+
+    // Re-check: don't deactivate if always_on or if new runs appeared
+    const project = db.prepare("SELECT always_on FROM projects WHERE id = ?").get(projectId) as
+      | { always_on: number }
+      | undefined;
+    if (!project || project.always_on) return;
+
+    const active = (
+      db
+        .prepare(
+          "SELECT COUNT(*) as count FROM runs WHERE project_id = ? AND status IN ('running','queued')",
+        )
+        .get(projectId) as { count: number }
+    ).count;
+    if (active > 0) return;
+
+    console.log(`[idle-timeout] Deactivating idle project ${projectName}`);
+    try {
+      const result = await callProjectctl("stop", { name: projectName });
+      if (result.ok) {
+        db.prepare("UPDATE projects SET lifecycle = 'stopped', updated_at = ? WHERE id = ?").run(
+          new Date().toISOString(),
+          projectId,
+        );
+      }
+    } catch (err) {
+      console.error(`[idle-timeout] Failed to stop ${projectName}:`, err);
+    }
+  }, IDLE_TIMEOUT_MS);
+
+  idleTimers.set(projectId, timer);
+}
+
+export function cancelIdleTimer(projectId: number): void {
+  const existing = idleTimers.get(projectId);
+  if (existing) {
+    clearTimeout(existing);
+    idleTimers.delete(projectId);
+  }
+}
+
+
 export class QueueManager {
   private processing = false;
 
@@ -135,9 +193,13 @@ export class QueueManager {
         .get(run.project_id) as any;
       if (!project) throw new Error("Project not found");
 
-      // Auto-activate project if stopped
+      // Auto-activate project if stopped; cancel any pending idle timer
+      cancelIdleTimer(project.id);
       if (this.runners.state(project.name) !== "connected") {
         await callProjectctl("start", { name: project.name });
+        this.db
+          .prepare("UPDATE projects SET lifecycle = 'active', updated_at = ? WHERE id = ?")
+          .run(new Date().toISOString(), project.id);
         let elapsed = 0;
         while (this.runners.state(project.name) !== "connected" && elapsed < 10000) {
           await new Promise((r) => setTimeout(r, 100));
@@ -318,6 +380,17 @@ export class QueueManager {
       // Notify SSE listeners that run is complete
       sseEmitter.emit(`run-${run.id}-end`);
       this.trigger();
+      // Schedule idle deactivation if no runs remain and project is not always-on
+      try {
+        const proj = this.db
+          .prepare("SELECT id, name, always_on FROM projects WHERE id = ?")
+          .get(run.project_id) as { id: number; name: string; always_on: number } | undefined;
+        if (proj && !proj.always_on) {
+          scheduleIdleDeactivation(this.db, proj.id, proj.name);
+        }
+      } catch {
+        // ignore — don't crash the queue over a timer
+      }
     }
   }
 }

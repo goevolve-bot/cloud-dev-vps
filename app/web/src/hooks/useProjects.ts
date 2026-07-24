@@ -1,14 +1,18 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { fetchProjects, type Project } from "../api";
 
 export interface UseProjectsResult {
   readonly projects: Project[] | null;
   readonly error: string | null;
+  readonly refresh: () => void;
 }
 
 export function useProjects(): UseProjectsResult {
   const [projects, setProjects] = useState<Project[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [tick, setTick] = useState(0);
+
+  const refresh = useCallback(() => setTick((t) => t + 1), []);
 
   useEffect(() => {
     let cancelled = false;
@@ -22,7 +26,7 @@ export function useProjects(): UseProjectsResult {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [tick]);
 
-  return { projects, error };
+  return { projects, error, refresh };
 }

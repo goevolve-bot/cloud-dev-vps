@@ -6,7 +6,7 @@ import { migrateDown, migrateUp, migrationStatus } from "./migrate.js";
 test("migrateUp creates the schema and migrateDown reverts it", () => {
   const db = openDb(":memory:");
   try {
-    assert.deepEqual(migrateUp(db), [1]);
+    assert.deepEqual(migrateUp(db), [1, 2]);
     assert.ok(migrationStatus(db).every((m) => m.applied));
 
     const insert = db.prepare(
@@ -24,7 +24,7 @@ test("migrateUp creates the schema and migrateDown reverts it", () => {
     };
     assert.equal(project.name, "demo");
 
-    assert.deepEqual(migrateDown(db), [1]);
+    assert.deepEqual(migrateDown(db, { to: 0 }), [2, 1]);
     assert.throws(() => db.prepare("SELECT * FROM projects").all());
   } finally {
     db.close();
@@ -45,7 +45,7 @@ test("migrateDown(to) reverts everything above a version", () => {
   const db = openDb(":memory:");
   try {
     migrateUp(db);
-    assert.deepEqual(migrateDown(db, { to: 0 }), [1]);
+    assert.deepEqual(migrateDown(db, { to: 0 }), [2, 1]);
     assert.ok(migrationStatus(db).every((m) => !m.applied));
   } finally {
     db.close();

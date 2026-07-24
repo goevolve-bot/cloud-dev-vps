@@ -13,7 +13,7 @@ interface ProjectShellProps {
 
 function ProjectShell({ tab }: ProjectShellProps) {
   const { project = "" } = useParams<{ project: string }>();
-  const { projects, error } = useProjects();
+  const { projects, error, refresh } = useProjects();
   const [theme, toggleTheme] = useTheme();
   const navigate = useNavigate();
 
@@ -43,6 +43,7 @@ function ProjectShell({ tab }: ProjectShellProps) {
         activeTab={tab}
         theme={theme}
         onToggleTheme={toggleTheme}
+        onProjectsRefresh={refresh}
       />
       {tab === "tasks" && <TasksPage project={current} />}
       {tab === "specs" && <SpecsPage project={current} />}

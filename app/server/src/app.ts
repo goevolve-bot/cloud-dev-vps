@@ -578,5 +578,175 @@ export function buildApp(ctx: AppContext): FastifyInstance {
     }
   });
 
+  // ─── Cost roll-ups (T37) ─────────────────────────────────────────────────
+
+  app.get("/api/costs/mtd", async () => {
+    const month = new Date().toISOString().slice(0, 7); // "YYYY-MM"
+    const row = db
+      .prepare(
+        "SELECT COALESCE(SUM(cost_usd), 0) as total FROM runs WHERE cost_usd IS NOT NULL AND created_at LIKE ?",
+      )
+      .get(`${month}%`) as { total: number };
+    return { totalUsd: row.total, month };
+  });
+
+  app.get("/api/projects/:name/costs", async (request, reply) => {
+    const { name } = request.params as { name: string };
+    const project = getProjectRow(name);
+    if (!project) return reply.code(404).send({ error: "project_not_found" });
+
+    const taskTotals = db
+      .prepare(
+        "SELECT task_num, COALESCE(SUM(cost_usd), 0) as total_usd FROM runs WHERE project_id = ? AND cost_usd IS NOT NULL GROUP BY task_num",
+      )
+      .all(project.id) as { task_num: number; total_usd: number }[];
+
+    const projectTotal = (
+      db
+        .prepare(
+          "SELECT COALESCE(SUM(cost_usd), 0) as total FROM runs WHERE project_id = ? AND cost_usd IS NOT NULL",
+        )
+        .get(project.id) as { total: number }
+    ).total;
+
+    return { taskTotals, projectTotal };
+  });
+
+  // ─── Project lifecycle toggle (T35) ──────────────────────────────────────
+
+  app.post("/api/projects/:name/lifecycle", async (request, reply) => {
+    const { name } = request.params as { name: string };
+    const project = getProjectRow(name);
+    if (!project) return reply.code(404).send({ error: "project_not_found" });
+
+    const body = request.body as { action?: string; alwaysOn?: boolean };
+    if (!body.action) return reply.code(400).send({ error: "action_required" });
+
+    if (body.action === "set-always-on") {
+      const val = body.alwaysOn ? 1 : 0;
+      db.prepare("UPDATE projects SET always_on = ?, updated_at = ? WHERE id = ?").run(
+        val,
+        new Date().toISOString(),
+        project.id,
+      );
+      return { ok: true, alwaysOn: Boolean(val) };
+    }
+
+    if (body.action === "start" || body.action === "stop") {
+      const { callProjectctl } = await import("./queue.js");
+      const result = await callProjectctl(body.action, { name });
+      if (result.ok) {
+        const lifecycle = body.action === "start" ? "active" : "stopped";
+        db.prepare("UPDATE projects SET lifecycle = ?, updated_at = ? WHERE id = ?").run(
+          lifecycle,
+          new Date().toISOString(),
+          project.id,
+        );
+      }
+      return { ok: result.ok, message: result.message };
+    }
+
+    return reply.code(400).send({ error: "unknown_action" });
+  });
+
+  // ─── Providers (T36) ─────────────────────────────────────────────────────
+
+  app.get("/api/providers", async () => {
+    const providerDefs = [
+      {
+        id: "claude",
+        name: "Claude (Anthropic)",
+        authType: "api-key" as const,
+        models: [
+          { id: "claude-3-5-sonnet-latest", name: "Claude 3.5 Sonnet" },
+          { id: "claude-3-5-haiku-latest", name: "Claude 3.5 Haiku" },
+          { id: "claude-3-opus-latest", name: "Claude 3 Opus" },
+        ],
+      },
+      {
+        id: "antigravity",
+        name: "Antigravity",
+        authType: "oauth" as const,
+        models: [
+          { id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5 (via AGY)" },
+          { id: "claude-3-7-sonnet-latest", name: "Claude 3.7 Sonnet (via AGY)" },
+          { id: "gemini-2.5-pro", name: "Gemini 2.5 Pro (via AGY)" },
+          { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash (via AGY)" },
+        ],
+      },
+    ];
+
+    const credRows = db.prepare("SELECT * FROM provider_creds").all() as {
+      provider: string;
+      masked_key: string;
+      connected_at: string;
+      account: string | null;
+    }[];
+
+    return {
+      providers: providerDefs.map((p) => {
+        const cred = credRows.find((c) => c.provider === p.id);
+        return {
+          ...p,
+          connected: Boolean(cred),
+          maskedKey: cred?.masked_key ?? null,
+          connectedAt: cred?.connected_at ?? null,
+          account: cred?.account ?? null,
+        };
+      }),
+    };
+  });
+
+  app.post("/api/providers/:provider/connect", async (request, reply) => {
+    const { provider } = request.params as { provider: string };
+    const body = request.body as { type?: string; key?: string };
+
+    if (body.type === "api-key") {
+      if (!body.key || typeof body.key !== "string") {
+        return reply.code(400).send({ error: "key_required" });
+      }
+      const { callProjectctl } = await import("./queue.js");
+      const credName =
+        provider === "claude" ? "ANTHROPIC_API_KEY" : `${provider.toUpperCase()}_API_KEY`;
+      const result = await callProjectctl("set-credential", {
+        name: "_pm",
+        credential: credName,
+        value: body.key,
+      });
+
+      const masked =
+        body.key.length > 8
+          ? `${body.key.slice(0, 4)}${"*".repeat(body.key.length - 8)}${body.key.slice(-4)}`
+          : "****";
+
+      db.prepare(
+        "INSERT INTO provider_creds (provider, masked_key, connected_at) VALUES (?, ?, ?) ON CONFLICT(provider) DO UPDATE SET masked_key = excluded.masked_key, connected_at = excluded.connected_at",
+      ).run(provider, masked, new Date().toISOString());
+
+      return { ok: true, maskedKey: masked, projectctlOk: result.ok };
+    }
+
+    return reply.code(400).send({ error: "unsupported_auth_type" });
+  });
+
+  app.patch("/api/projects/:name/defaults", async (request, reply) => {
+    const { name } = request.params as { name: string };
+    const project = getProjectRow(name);
+    if (!project) return reply.code(404).send({ error: "project_not_found" });
+
+    const body = request.body as { provider?: string; model?: string };
+    db.prepare(
+      "UPDATE projects SET default_provider = ?, default_model = ?, updated_at = ? WHERE id = ?",
+    ).run(
+      body.provider ?? project.default_provider,
+      body.model ?? project.default_model,
+      new Date().toISOString(),
+      project.id,
+    );
+
+    const updated = getProjectRow(name)!;
+    return serializeProject(updated, runners.state(updated.name));
+  });
+
   return app;
 }

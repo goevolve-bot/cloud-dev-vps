@@ -265,3 +265,71 @@ export async function fetchAdrs(project: string): Promise<Adr[]> {
   const body = await getJson<{ adrs: Adr[] }>(`/api/projects/${project}/adrs`);
   return body.adrs;
 }
+
+// ─── Cost roll-ups (T37) ─────────────────────────────────────────────────────
+
+export interface MtdCost {
+  readonly totalUsd: number;
+  readonly month: string;
+}
+
+export async function fetchMtdCost(): Promise<MtdCost> {
+  return getJson<MtdCost>("/api/costs/mtd");
+}
+
+export interface ProjectCosts {
+  readonly taskTotals: { task_num: number; total_usd: number }[];
+  readonly projectTotal: number;
+}
+
+export async function fetchProjectCosts(project: string): Promise<ProjectCosts> {
+  return getJson<ProjectCosts>(`/api/projects/${project}/costs`);
+}
+
+// ─── Lifecycle (T35) ─────────────────────────────────────────────────────────
+
+export async function setProjectLifecycle(
+  project: string,
+  action: "start" | "stop" | "set-always-on",
+  alwaysOn?: boolean,
+): Promise<{ ok: boolean; alwaysOn?: boolean }> {
+  return sendJson(`/api/projects/${project}/lifecycle`, "POST", { action, alwaysOn });
+}
+
+// ─── Provider setup (T36) ────────────────────────────────────────────────────
+
+export interface ProviderModel {
+  readonly id: string;
+  readonly name: string;
+}
+
+export interface ProviderInfo {
+  readonly id: string;
+  readonly name: string;
+  readonly authType: "api-key" | "oauth";
+  readonly models: ProviderModel[];
+  readonly connected: boolean;
+  readonly maskedKey: string | null;
+  readonly connectedAt: string | null;
+  readonly account: string | null;
+}
+
+export async function fetchProviders(): Promise<ProviderInfo[]> {
+  const body = await getJson<{ providers: ProviderInfo[] }>("/api/providers");
+  return body.providers;
+}
+
+export async function connectProvider(
+  provider: string,
+  input: { type: "api-key"; key: string },
+): Promise<{ ok: boolean; maskedKey: string }> {
+  return sendJson(`/api/providers/${provider}/connect`, "POST", input);
+}
+
+export async function updateProjectDefaults(
+  project: string,
+  input: { provider?: string; model?: string },
+): Promise<Project> {
+  return sendJson<Project>(`/api/projects/${project}/defaults`, "PATCH", input);
+}
+

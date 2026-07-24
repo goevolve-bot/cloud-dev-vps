@@ -7,12 +7,14 @@ import {
   createRun,
   stopRun,
   answerQuestion,
+  fetchProjectCosts,
   type Task,
   type TaskStatus,
   type Comment as ApiComment,
   type TaskRun,
   type QueueRun,
   type Question,
+  type Project,
 } from "../api";
 import { useAttachments } from "../hooks/useAttachments";
 import { AttachmentsBar } from "./AttachmentsBar";
@@ -291,11 +293,12 @@ function InlineQuestions({ questions, onAnswer }: InlineQuestionsProps) {
 export interface TaskViewProps {
   readonly task: Task;
   readonly project: string;
+  readonly projectInfo?: Project;
   readonly onSave: (description: string) => Promise<void>;
   readonly onStatusChange: (status: TaskStatus) => Promise<void>;
 }
 
-export function TaskView({ task, project, onSave, onStatusChange }: TaskViewProps) {
+export function TaskView({ task, project, projectInfo, onSave, onStatusChange }: TaskViewProps) {
   const [mode, setMode] = useState<"preview" | "edit">("preview");
   const [draft, setDraft] = useState(task.description);
   const [saving, setSaving] = useState(false);
@@ -307,10 +310,13 @@ export function TaskView({ task, project, onSave, onStatusChange }: TaskViewProp
   const [queueRuns, setQueueRuns] = useState<QueueRun[]>([]);
   const [questions, setQuestions] = useState<Question[]>([]);
   const [plan, setPlan] = useState<string | null>(null);
+  const [taskCostTotal, setTaskCostTotal] = useState<number | null>(null);
 
   const [runPhase, setRunPhase] = useState("implement");
-  const [runProvider, setRunProvider] = useState("claude");
-  const [runModel, setRunModel] = useState("claude-3-5-sonnet-latest");
+  const [runProvider, setRunProvider] = useState(projectInfo?.defaultProvider ?? "claude");
+  const [runModel, setRunModel] = useState(
+    projectInfo?.defaultModel ?? "claude-3-5-sonnet-latest",
+  );
   const [runPrompt, setRunPrompt] = useState("");
   const [runningAction, setRunningAction] = useState(false);
 
@@ -330,10 +336,21 @@ export function TaskView({ task, project, onSave, onStatusChange }: TaskViewProp
         console.error("Failed to load details", err);
       }
     }
+    async function loadCosts() {
+      try {
+        const costs = await fetchProjectCosts(project);
+        const taskEntry = costs.taskTotals.find((t) => t.task_num === task.id);
+        setTaskCostTotal(taskEntry?.total_usd ?? 0);
+      } catch {
+        // ignore
+      }
+    }
     void loadDetails();
+    void loadCosts();
 
     const interval = setInterval(() => {
       void loadDetails();
+      void loadCosts();
     }, 3000);
     return () => clearInterval(interval);
   }, [project, task.id]);
@@ -474,6 +491,12 @@ export function TaskView({ task, project, onSave, onStatusChange }: TaskViewProp
         <strong>
           #{task.id} {task.title}
         </strong>
+        {taskCostTotal !== null && taskCostTotal > 0 && (
+          <span className="chip" style={{ fontVariantNumeric: "tabular-nums", fontSize: 11 }}
+            title="Total cost for this task">
+            💰 ${taskCostTotal.toFixed(4)}
+          </span>
+        )}
         <select
           className="project-select"
           value={task.status}
@@ -518,16 +541,36 @@ export function TaskView({ task, project, onSave, onStatusChange }: TaskViewProp
             </label>
             <label>
               Provider:
-              <select value={runProvider} onChange={(e) => setRunProvider(e.target.value)}>
+              <select value={runProvider} onChange={(e) => {
+                setRunProvider(e.target.value);
+                // reset model when provider changes
+                if (e.target.value === "antigravity") {
+                  setRunModel("claude-sonnet-4-5");
+                } else {
+                  setRunModel("claude-3-5-sonnet-latest");
+                }
+              }}>
                 <option value="claude">Claude</option>
+                <option value="antigravity">Antigravity</option>
               </select>
             </label>
             <label>
               Model:
               <select value={runModel} onChange={(e) => setRunModel(e.target.value)}>
-                <option value="claude-3-5-sonnet-latest">Claude 3.5 Sonnet</option>
-                <option value="claude-3-5-haiku-latest">Claude 3.5 Haiku</option>
-                <option value="claude-3-opus-latest">Claude 3 Opus</option>
+                {runProvider === "antigravity" ? (
+                  <>
+                    <option value="claude-sonnet-4-5">Claude Sonnet 4.5 (via AGY)</option>
+                    <option value="claude-3-7-sonnet-latest">Claude 3.7 Sonnet (via AGY)</option>
+                    <option value="gemini-2.5-pro">Gemini 2.5 Pro (via AGY)</option>
+                    <option value="gemini-2.5-flash">Gemini 2.5 Flash (via AGY)</option>
+                  </>
+                ) : (
+                  <>
+                    <option value="claude-3-5-sonnet-latest">Claude 3.5 Sonnet</option>
+                    <option value="claude-3-5-haiku-latest">Claude 3.5 Haiku</option>
+                    <option value="claude-3-opus-latest">Claude 3 Opus</option>
+                  </>
+                )}
               </select>
             </label>
             <button
