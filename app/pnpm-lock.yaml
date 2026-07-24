@@ -59,6 +59,9 @@ importers:
 
   server:
     dependencies:
+      "@pm/core":
+        specifier: workspace:*
+        version: link:../core
       better-sqlite3:
         specifier: ^11.8.1
         version: 11.10.0

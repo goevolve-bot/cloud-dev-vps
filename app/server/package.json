@@ -12,6 +12,7 @@
     "test": "tsc -p tsconfig.json && node --test 'dist/**/*.test.js'"
   },
   "dependencies": {
+    "@pm/core": "workspace:*",
     "better-sqlite3": "^11.8.1"
   },
   "devDependencies": {

@@ -117,6 +117,15 @@ export async function readTask(
   };
 }
 
+/** Locates one task by id without parsing every task's index.md, unlike listTasks. */
+export async function findTask(pmDir: string, id: number): Promise<TaskRecord | null> {
+  for (const status of TASK_STATUSES) {
+    const match = (await taskDirNames(pmDir, status)).find((name) => parseLeadingId(name) === id);
+    if (match) return readTask(pmDir, status, match);
+  }
+  return null;
+}
+
 export async function listTasks(pmDir: string): Promise<TaskRecord[]> {
   const records: TaskRecord[] = [];
   for (const status of TASK_STATUSES) {
