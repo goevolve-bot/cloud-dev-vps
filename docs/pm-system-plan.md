@@ -85,7 +85,7 @@ socket and the secrets and exposes only a narrow API to pm.
 ```
 host
 ├─ user pm  (rootless dockerd A) — the PM app zone
-│    pm stack (compose): nginx (TLS + basic auth, 80/443) + pm (Fastify).
+│    pm stack (compose): nginx (TLS + basic auth, 443 only) + pm (Fastify).
 │    Holds: SQLite cache, JSONL logs, extracted artifacts, its own npm deps.
 │    Holds NO project socket, NO deploy key, NO OAuth token.
 │    Talks to each project only via that project's runner control socket.
@@ -177,8 +177,9 @@ one sitting, and a CLI invocation over SSH remains possible for the paranoid
 path.
 
 Rootless Docker can't bind ports <1024 by default; Ansible sets
-`net.ipv4.ip_unprivileged_port_start=80` so nginx (on the pm daemon) can
-publish 80/443.
+`net.ipv4.ip_unprivileged_port_start=443` so nginx (on the pm daemon) can
+publish 443. There is no plaintext :80 listener — Cloudflare (Full strict)
+always connects to the origin over HTTPS, so nothing needs port 80.
 
 ## Phases and their outcomes
 
@@ -427,18 +428,21 @@ roles/
   `/srv/pm/runners/` (runner control sockets, group-readable by pm only); sync
   `app/` to the VPS; build `pm` + `pm-agent` images and bring up the compose
   stack as the `pm` user (systemd user unit wrapping `docker compose up -d`,
-  linger enabled); set sysctl `net.ipv4.ip_unprivileged_port_start=80`; render
-  nginx conf + htpasswd from vaulted `pm_auth_password`; install the
-  `pm-projectctl` helper service. **No provider creds in Ansible** — providers
-  are connected from the UI (see Provider setup) after deploy.
+  linger enabled); set sysctl `net.ipv4.ip_unprivileged_port_start=443`;
+  render nginx conf (incl. the Cloudflare `set_real_ip_from` list) + htpasswd
+  from vaulted `pm_auth_password`; install the `pm-projectctl` helper service.
+  **No provider creds in Ansible** — providers are connected from the UI (see
+  Provider setup) after deploy.
 - **TLS: self-signed origin cert; Cloudflare terminates public TLS.** The
   service sits behind Cloudflare, so nginx serves a self-signed origin
   certificate (generated once into a volume) and Cloudflare is set to *Full
-  (strict)* against it — no certbot, no Let's Encrypt, no `pm_domain`
-  cert dance. Optionally lock the origin to Cloudflare's IP ranges + a
-  header/mTLS check at nginx.
-- **`roles/nftables`**: template gains 80/443 accept rules (optionally scoped
-  to Cloudflare IP ranges so the origin isn't reachable directly).
+  (strict)* against it — no certbot, no Let's Encrypt, no `pm_domain` cert
+  dance, and no plaintext :80 listener at all (Cloudflare always connects to
+  the origin over HTTPS in this mode). nginx trusts Cloudflare's published IP
+  ranges via `set_real_ip_from` + `real_ip_header CF-Connecting-IP` to recover
+  the true client IP.
+- **`roles/nftables`**: template gains a 443 accept rule, optionally scoped to
+  Cloudflare IP ranges so the origin isn't reachable directly.
 - No host Node/nginx dependencies — the host needs only rootless Docker
   tooling, which the playbook already provides.
 

@@ -60,7 +60,6 @@ services:
       - certs:/etc/nginx/certs:ro
       - auth:/etc/nginx/auth:ro
     ports:
-      - "80:80"
       - "443:443"
 
 volumes:

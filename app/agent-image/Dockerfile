@@ -1,8 +1,9 @@
 # pm-agent: the only place project secrets (deploy key, provider OAuth token)
 # ever appear (see docs/pm-system-plan.md). Deliberately carries NO project
 # language toolchains — all project code builds/runs only in the project's
-# own containers via the mounted rootless docker socket.
-FROM node:22-bookworm-slim
+# own containers via the mounted rootless docker socket. Both CLIs below use
+# their native installers (no npm/node), so this image needs no Node.js.
+FROM debian:bookworm-slim
 
 ARG DELTA_VERSION=0.18.2
 ARG DOCKER_VERSION=27.4.1
@@ -60,11 +61,11 @@ RUN set -eu; \
       "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-${COMPOSE_ARCH}"; \
     chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
 
-RUN npm install -g @anthropic-ai/claude-code
-
-# Antigravity CLI: its installer drops the binary at ~/.local/bin/agy (same
-# path used by roles/dev_tools/tasks/runtime_tools.yml on the host).
+# Claude Code + Antigravity CLI: native installers, both drop their binary at
+# ~/.local/bin (same path used by roles/dev_tools/tasks/runtime_tools.yml on
+# the host), so no npm/node is needed in this image.
 ENV PATH="/root/.local/bin:${PATH}"
+RUN curl -fsSL https://claude.ai/install.sh | bash
 RUN curl -fsSL https://antigravity.google/cli/install.sh | bash
 
 WORKDIR /workspace
