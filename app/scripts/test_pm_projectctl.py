@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import pwd
@@ -20,6 +21,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 MODULE_PATH = Path(__file__).with_name("pm-projectctl")
 _loader = importlib.machinery.SourceFileLoader("pm_projectctl", str(MODULE_PATH))
@@ -60,6 +62,18 @@ class ProjectNameTests(unittest.TestCase):
             with self.assertRaises(ctl.PmError) as caught:
                 ctl.validate_project_name(name)
             self.assertEqual(caught.exception.code, "invalid_name")
+
+
+class CredentialKeyTests(unittest.TestCase):
+    def test_accepts_plain_keys(self):
+        for key in ("claude", "antigravity-api-key", "a", "k" * 64):
+            self.assertEqual(ctl.validate_credential_key(key), key)
+
+    def test_rejects_bad_keys(self):
+        for key in ("", "Claude", "1claude", "claude key", "claude/../etc", "k" * 65, None, 42):
+            with self.assertRaises(ctl.PmError) as caught:
+                ctl.validate_credential_key(key)
+            self.assertEqual(caught.exception.code, "invalid_key")
 
 
 class GitUrlTests(unittest.TestCase):
@@ -286,6 +300,10 @@ class RequestHandlingTests(unittest.TestCase):
             ("create", {"name": "ok", "gitUrl": "ext::sh -c id"}, "invalid_url"),
             ("start", {"name": "../etc"}, "invalid_name"),
             ("stop", {}, "invalid_name"),
+            ("delete", {"name": "BAD"}, "invalid_name"),
+            ("set-credential", {"name": "BAD", "key": "claude", "value": "x"}, "invalid_name"),
+            ("set-credential", {"name": "ok", "key": "BAD KEY", "value": "x"}, "invalid_key"),
+            ("set-credential", {"name": "ok", "key": "claude"}, "invalid_value"),
         ):
             self.events = []
             self.dispatch(json.dumps({"verb": verb, "args": args}).encode(), None)
@@ -372,6 +390,32 @@ class CliTests(unittest.TestCase):
     def test_a_verb_is_required(self):
         with self.assertRaises(SystemExit):
             ctl.build_parser().parse_args([])
+
+    def test_delete_purge_flag_defaults_off(self):
+        opts = ctl.build_parser().parse_args(["delete", "demo"])
+        self.assertEqual(opts.name, "demo")
+        self.assertFalse(opts.purge)
+        opts = ctl.build_parser().parse_args(["delete", "demo", "--purge"])
+        self.assertTrue(opts.purge)
+
+    def test_set_credential_maps_positionals(self):
+        opts = ctl.build_parser().parse_args(["set-credential", "demo", "claude"])
+        self.assertEqual(opts.name, "demo")
+        self.assertEqual(opts.key, "claude")
+
+    def test_set_credential_reads_value_from_stdin_not_argv(self):
+        captured = {}
+
+        def fake_run_local(cfg, verb, args):
+            captured.update(args)
+            return 0
+
+        with mock.patch.object(ctl, "run_local", fake_run_local), mock.patch(
+            "sys.stdin", io.StringIO("sk-secret-token\n")
+        ):
+            exit_code = ctl.main(["set-credential", "demo", "claude"])
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(captured, {"name": "demo", "key": "claude", "value": "sk-secret-token"})
 
 
 if __name__ == "__main__":

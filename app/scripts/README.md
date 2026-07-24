@@ -1,6 +1,6 @@
 # `pm-projectctl`
 
-The PM system's single root-touching interface (tasks T07 + T08 in
+The PM system's single root-touching interface (tasks T07, T08, T09 in
 `docs/pm-task-breakdown.md`). The pm web app runs unprivileged as user `pm`,
 holds no project docker socket and no project secret; everything privileged
 happens here, behind a validated verb set on a unix socket owned `root:pm`.
@@ -28,8 +28,8 @@ Deployed by `roles/pm` (T41) to `/usr/local/sbin/pm-projectctl`.
 | `start` | `name` | starts the project's rootless docker + runner |
 | `stop` | `name` | stops the runner + rootless docker |
 | `status` | `name` (optional) | per-project unit states, socket presence, metadata |
-
-`delete` and `set-credential` are T09.
+| `delete` | `name`, `purge` (optional) | stops + removes the user; `purge` also removes home (repo, key, docker images) |
+| `set-credential` | `name`, `key`, `value` | writes `~/.pm-creds/<key>` (0600, that user only) |
 
 ### Protocol
 
@@ -92,6 +92,24 @@ a `result` event.
    `UMask=0007` plus the setgid runner directory make the control socket
    `0770 pm-<name>:pm`: pm can connect, other project users cannot even
    traverse the directory.
+
+## What `delete` and `set-credential` do
+
+`delete` reverses `create`: stop the runner + rootless docker, disable linger,
+`userdel` the `pm-<name>` account, then remove its runner socket directory and
+state file. Without `--purge`, `userdel` alone leaves the home directory (repo
+clone, deploy key, rootless docker's image/volume store) on disk. With
+`--purge`, `userdel --remove` deletes the home directory too — since the
+rootless daemon's data root lives under it by default, that's also how
+image/volume data gets purged, with no separate teardown step. `userdel` is
+retried for a few seconds if it reports the account still in use, since
+`rootlesskit`'s supervisor can take a moment to exit after `stop`.
+
+`set-credential` writes a provider token or API key straight into
+`~/.pm-creds/<key>` (0600, owned by `pm-<name>` alone) — pm never reads or
+stores the value, only a masked status, per the isolation model in
+`docs/pm-system-plan.md`. Over the CLI the value is read from stdin, never
+argv, so it never appears in `ps` output or shell history.
 
 ### Why `/srv/pm/runners/<name>/control.sock` and not `<name>.sock`
 

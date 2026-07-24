@@ -77,7 +77,7 @@ MAX_REQUEST_BYTES = 64 * 1024
 
 BASE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-# Tools every verb needs, plus the extra ones only `create` needs.
+# Tools every verb needs, plus the extra ones only `create`/`delete` need.
 CORE_TOOLS = ["systemctl", "loginctl"]
 CREATE_TOOLS = [
     "useradd",
@@ -88,6 +88,7 @@ CREATE_TOOLS = [
     "newgidmap",
     "dockerd-rootless-setuptool.sh",
 ]
+DELETE_TOOLS = ["userdel"]
 
 # `.pm/` skeleton — the repo-stored task board (docs/pm-system-plan.md). T05's
 # model library owns the richer read/write side; create only needs the tree to
@@ -198,6 +199,9 @@ ALLOWED_URL_SCHEMES = ("https://", "ssh://")
 
 REPO_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
+# Credential file names under ~/.pm-creds/ — e.g. "claude", "antigravity-api-key".
+CREDENTIAL_KEY_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+
 
 def validate_project_name(value: Any) -> str:
     if not isinstance(value, str) or not value:
@@ -232,6 +236,17 @@ def validate_git_url(value: Any) -> str:
         "invalid_url",
         "git URL must be https://, ssh:// or user@host:path (got %r)" % value,
     )
+
+
+def validate_credential_key(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        raise PmError("invalid_key", "credential key is required")
+    if not CREDENTIAL_KEY_RE.match(value):
+        raise PmError(
+            "invalid_key",
+            "credential key must match [a-z][a-z0-9_-]{0,63} (got %r)" % value,
+        )
+    return value
 
 
 def repo_dir_name(url: str) -> str:
@@ -1062,6 +1077,85 @@ def verb_stop(args: Dict[str, Any], cfg: Config, emit: Emit) -> Dict[str, Any]:
         return {"name": name, "state": "stopped"}
 
 
+def _userdel(argv: Sequence[str], timeout: int) -> None:
+    """`userdel` can transiently fail right after stopping the user's daemon
+    ("user ... is currently used by process ...") while rootlesskit's
+    supervisor finishes exiting, so this retries instead of failing create's
+    mirror-image operation on a race.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            run(list(argv))
+            return
+        except CommandError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(1)
+
+
+def verb_delete(args: Dict[str, Any], cfg: Config, emit: Emit) -> Dict[str, Any]:
+    """Remove a project's user, reversing `create`.
+
+    Without `purge`, the home directory (repo clone, rootless docker image
+    store, deploy key) is left on disk — `userdel` alone does not touch it.
+    With `purge`, `userdel --remove` deletes it too; since the rootless
+    daemon's data root lives under the home directory by default, that is
+    also how image/volume data gets purged, with no separate teardown step.
+    """
+    name = validate_project_name(args.get("name"))
+    purge = bool(args.get("purge", False))
+    preflight(cfg, CORE_TOOLS + DELETE_TOOLS)
+    pw = _require_existing(cfg, name)
+    with project_lock(cfg, name):
+        emit("runner", "stopping runner")
+        user_systemctl(pw.pw_name, ["stop", "runner"], check=False)
+        emit("docker", "stopping rootless docker")
+        user_systemctl(pw.pw_name, ["stop", "docker"], check=False)
+        emit("linger", "disabling linger")
+        run(["loginctl", "disable-linger", pw.pw_name], check=False)
+        run(["loginctl", "terminate-user", pw.pw_name], check=False)
+
+        emit("user", "removing user %s%s" % (pw.pw_name, " (purging data)" if purge else ""))
+        argv = ["userdel", "--remove", pw.pw_name] if purge else ["userdel", pw.pw_name]
+        _userdel(argv, cfg.wait_timeout)
+
+        emit("cleanup", "removing runner socket directory")
+        shutil.rmtree(runner_dir_path(cfg, name), ignore_errors=True)
+
+        emit("cleanup", "removing project state")
+        try:
+            os.remove(state_path(cfg, name))
+        except OSError as exc:
+            if exc.errno != errno.ENOENT:
+                raise
+
+        emit("done", "project %s removed" % name)
+        return {"name": name, "deleted": True, "purged": purge}
+
+
+def verb_set_credential(args: Dict[str, Any], cfg: Config, emit: Emit) -> Dict[str, Any]:
+    """Write a secret into a project's ~/.pm-creds/<key> (0600, that user only).
+
+    pm never sees the value: it flows UI -> pm -> this socket -> the file,
+    one way, per the isolation model in docs/pm-system-plan.md.
+    """
+    name = validate_project_name(args.get("name"))
+    key = validate_credential_key(args.get("key"))
+    value = args.get("value")
+    if not isinstance(value, str):
+        raise PmError("invalid_value", "credential value must be a string")
+    preflight(cfg, CORE_TOOLS)
+    pw = _require_existing(cfg, name)
+    with project_lock(cfg, name):
+        creds_dir = os.path.join(pw.pw_dir, ".pm-creds")
+        ensure_dir(creds_dir, 0o700, pw.pw_uid, pw.pw_gid)
+        path = os.path.join(creds_dir, key)
+        write_file(path, value, 0o600, pw.pw_uid, pw.pw_gid)
+        emit("credential", "wrote %s" % key)
+        return {"name": name, "key": key, "written": True}
+
+
 def _unit_state(user: str, unit: str) -> str:
     result = user_systemctl(user, ["is-active", unit], check=False, timeout=30)
     return (result.stdout or result.stderr or "unknown").strip()
@@ -1107,6 +1201,8 @@ VERBS: Dict[str, Callable[[Dict[str, Any], Config, Emit], Dict[str, Any]]] = {
     "start": verb_start,
     "stop": verb_stop,
     "status": verb_status,
+    "delete": verb_delete,
+    "set-credential": verb_set_credential,
 }
 
 
@@ -1330,6 +1426,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="report project state")
     status.add_argument("name", nargs="?")
+
+    delete = sub.add_parser("delete", help="remove a project's user, reversing create")
+    delete.add_argument("name")
+    delete.add_argument(
+        "--purge",
+        action="store_true",
+        help="also remove the home directory: repo clone, deploy key, and the "
+        "rootless docker image/volume store",
+    )
+
+    set_credential = sub.add_parser(
+        "set-credential",
+        help="write a secret into a project's ~/.pm-creds/<key> (0600, that user only); "
+        "the value is read from stdin, never from argv",
+    )
+    set_credential.add_argument("name")
+    set_credential.add_argument("key")
     return parser
 
 
@@ -1355,6 +1468,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args["name"] = opts.name
     if getattr(opts, "git_url", None) is not None:
         args["gitUrl"] = opts.git_url
+    if getattr(opts, "purge", False):
+        args["purge"] = True
+    if opts.command == "set-credential":
+        args["key"] = opts.key
+        value = sys.stdin.read()
+        if value.endswith("\n"):
+            value = value[:-1]
+        args["value"] = value
 
     if opts.remote or opts.socket:
         return call_socket(opts.socket or cfg.socket_path, opts.command, args)

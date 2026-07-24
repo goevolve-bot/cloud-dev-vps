@@ -17,6 +17,7 @@ import grp
 import importlib.machinery
 import importlib.util
 import os
+import pwd
 import shutil
 import stat
 import subprocess
@@ -172,6 +173,63 @@ class ProvisioningTests(unittest.TestCase):
         )
         self.assertEqual(failure, "awaiting-key")
         self.assertFalse(os.path.exists(dest))
+
+    def test_set_credential_writes_an_owner_only_file(self):
+        ctl.ensure_home_layout(self.cfg, self.pw)
+        events = []
+        result = ctl.verb_set_credential(
+            {"name": PROJECT, "key": "claude", "value": "sk-secret-token"},
+            self.cfg,
+            lambda step, message: events.append((step, message)),
+        )
+        self.assertEqual(result, {"name": PROJECT, "key": "claude", "written": True})
+        path = os.path.join(self.pw.pw_dir, ".pm-creds", "claude")
+        self.assertEqual(self._mode(path), 0o600)
+        self.assertEqual(os.stat(path).st_uid, self.pw.pw_uid)
+        self.assertEqual(self._group_of(path), self.pw.pw_name)
+        with open(path, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "sk-secret-token")
+        self.assertTrue(events)
+
+    def test_set_credential_overwrites_in_place(self):
+        ctl.ensure_home_layout(self.cfg, self.pw)
+        ctl.verb_set_credential({"name": PROJECT, "key": "claude", "value": "one"}, self.cfg, lambda *a: None)
+        ctl.verb_set_credential({"name": PROJECT, "key": "claude", "value": "two"}, self.cfg, lambda *a: None)
+        path = os.path.join(self.pw.pw_dir, ".pm-creds", "claude")
+        with open(path, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "two")
+
+    def test_delete_removes_the_user_but_keeps_home_without_purge(self):
+        ctl.ensure_home_layout(self.cfg, self.pw)
+        ctl.write_state(self.cfg, PROJECT, {"gitUrl": "git@example.com:x.git", "status": "ready"})
+        home = self.pw.pw_dir
+        self.addCleanup(shutil.rmtree, home, True)
+
+        result = ctl.verb_delete({"name": PROJECT}, self.cfg, lambda *a: None)
+        self.assertEqual(result, {"name": PROJECT, "deleted": True, "purged": False})
+
+        with self.assertRaises(KeyError):
+            pwd.getpwnam(self.cfg.user_for(PROJECT))
+        self.assertTrue(os.path.isdir(home))
+        self.assertFalse(os.path.exists(ctl.state_path(self.cfg, PROJECT)))
+        self.assertFalse(os.path.isdir(ctl.runner_dir_path(self.cfg, PROJECT)))
+
+    def test_delete_purge_removes_home_too(self):
+        ctl.ensure_home_layout(self.cfg, self.pw)
+        home = self.pw.pw_dir
+        self.addCleanup(shutil.rmtree, home, True)
+
+        result = ctl.verb_delete({"name": PROJECT, "purge": True}, self.cfg, lambda *a: None)
+        self.assertEqual(result, {"name": PROJECT, "deleted": True, "purged": True})
+        self.assertFalse(os.path.exists(home))
+
+    def test_delete_is_idempotent_with_the_create_error_contract(self):
+        ctl.ensure_home_layout(self.cfg, self.pw)
+        self.addCleanup(shutil.rmtree, self.pw.pw_dir, True)
+        ctl.verb_delete({"name": PROJECT}, self.cfg, lambda *a: None)
+        with self.assertRaises(ctl.PmError) as caught:
+            ctl.verb_delete({"name": PROJECT}, self.cfg, lambda *a: None)
+        self.assertEqual(caught.exception.code, "unknown_project")
 
 
 if __name__ == "__main__":
