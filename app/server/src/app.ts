@@ -15,6 +15,8 @@ import {
   readAttachment,
   writeAttachment,
   writeTaskDescription,
+  listSpecs,
+  listAdrs,
   type TaskStatus,
 } from "@pm/core";
 import { reindexTask } from "./indexer/index.js";
@@ -200,7 +202,59 @@ export function buildApp(ctx: AppContext): FastifyInstance {
     const queueRuns = db
       .prepare("SELECT * FROM runs WHERE project_id = ? AND task_num = ? ORDER BY id")
       .all(project.id, num);
-    return { task: serializeTask(task), comments, runs, queueRuns };
+    const questions = db
+      .prepare("SELECT * FROM questions WHERE project_id = ? AND task_num = ? ORDER BY id")
+      .all(project.id, num);
+    
+    let plan = null;
+    if (project.repo_dir) {
+      try {
+        const pmDir = pmDirFor(project.repo_dir);
+        const taskRecord = await findTask(pmDir, num);
+        if (taskRecord) {
+          plan = readFileSync(join(taskRecord.dir, "plan.md"), "utf8");
+        }
+      } catch {
+        // ignore
+      }
+    }
+    return { task: serializeTask(task), comments, runs, queueRuns, questions, plan };
+  });
+
+  app.post("/api/questions/:id/answer", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const body = request.body as { answer: string };
+    if (typeof body.answer !== "string") {
+      return reply.code(400).send({ error: "answer_required" });
+    }
+    const result = db
+      .prepare("UPDATE questions SET answer = ?, answered_at = ? WHERE id = ?")
+      .run(body.answer, new Date().toISOString(), Number(id));
+    if (result.changes === 0) {
+      return reply.code(404).send({ error: "question_not_found" });
+    }
+    const question = db.prepare("SELECT * FROM questions WHERE id = ?").get(Number(id));
+    return { question };
+  });
+
+  app.get("/api/projects/:name/specs", async (request, reply) => {
+    const { name } = request.params as { name: string };
+    const project = getProjectRow(name);
+    if (!project) return reply.code(404).send({ error: "project_not_found" });
+    if (!project.repo_dir) return reply.code(409).send({ error: "project_has_no_repo" });
+    const pmDir = pmDirFor(project.repo_dir);
+    const specs = await listSpecs(pmDir);
+    return { specs };
+  });
+
+  app.get("/api/projects/:name/adrs", async (request, reply) => {
+    const { name } = request.params as { name: string };
+    const project = getProjectRow(name);
+    if (!project) return reply.code(404).send({ error: "project_not_found" });
+    if (!project.repo_dir) return reply.code(409).send({ error: "project_has_no_repo" });
+    const pmDir = pmDirFor(project.repo_dir);
+    const adrs = await listAdrs(pmDir);
+    return { adrs };
   });
 
   app.post("/api/projects/:name/tasks", async (request, reply) => {

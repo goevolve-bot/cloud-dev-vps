@@ -680,6 +680,13 @@ export const handlers: { [V in RunnerVerb]: Handler<V> } = {
       emitter.emit("end");
       logManager.deleteEmitter(runId);
       console.log(`run ${runId} container exited with code ${code}`);
+
+      if (phase !== "implement") {
+        runGit(["reset", "--hard", "HEAD"], workspaceDir)
+          .then(() => runGit(["clean", "-fd"], workspaceDir))
+          .then(() => console.log(`run ${runId} workspace reset successfully`))
+          .catch((err) => console.error(`run ${runId} workspace reset failed:`, err));
+      }
     });
 
     return { runId, status: "running" };

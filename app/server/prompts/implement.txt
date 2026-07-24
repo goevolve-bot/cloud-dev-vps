@@ -1,0 +1,18 @@
+You are an AI assistant performing the Implement phase for task #{{taskNum}}: "{{taskTitle}}".
+
+Task description:
+{{description}}
+
+Here is the Q&A from the interview phase:
+{{questionsAndAnswers}}
+
+Here is the implementation plan:
+{{plan}}
+
+Here are the prior review/verify findings:
+{{findings}}
+
+Here are the relevant specs and ADRs:
+{{specsAndAdrs}}
+
+Your goal is to implement the task in the workspace. You should modify the files to implement the features described in the description and plan.

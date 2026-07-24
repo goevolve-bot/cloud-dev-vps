@@ -1,11 +1,12 @@
 import { EventEmitter } from "node:events";
-import { appendFile, mkdir, readdir, copyFile } from "node:fs/promises";
+import { appendFile, mkdir, readdir, copyFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createConnection } from "node:net";
 import type Database from "better-sqlite3";
-import { addRunOutcome, getAdapter, pmDirFor, findTask } from "@pm/core";
+import { addRunOutcome, getAdapter, pmDirFor, findTask, writeTaskDescription, moveTaskStatus } from "@pm/core";
 import { reindexTask } from "./indexer/index.js";
 import type { RunnerRegistry } from "./runners/registry.js";
+import { composePrompt, parseInterviewQuestions } from "./prompts.js";
 
 export const sseEmitter = new EventEmitter();
 
@@ -155,31 +156,26 @@ export class QueueManager {
         .prepare("UPDATE runs SET status = 'running', started_at = ? WHERE id = ?")
         .run(new Date().toISOString(), run.id);
 
-      let prompt = run.prompt || "";
-      if (run.phase === "implement") {
-        const lastFailedVerify = this.db
-          .prepare(
-            "SELECT outcome FROM task_runs WHERE project_id = ? AND task_num = ? AND phase = 'verify' AND status = 'failed' ORDER BY run_num DESC LIMIT 1"
-          )
-          .get(run.project_id, run.task_num) as { outcome: string } | undefined;
-        if (lastFailedVerify && lastFailedVerify.outcome) {
-          prompt += `\n\nPrevious verification failed with the following output:\n${lastFailedVerify.outcome}`;
-        }
+      const pmDir = pmDirFor(project.repo_dir);
+      const task = await findTask(pmDir, run.task_num);
+      if (!task) throw new Error("Task not found");
 
-        let isCompliant = false;
-        if (project.contract_json) {
-          try {
-            const parsed = JSON.parse(project.contract_json);
-            if (parsed && parsed.isCompliant) {
-              isCompliant = true;
-            }
-          } catch {
-            // ignore
-          }
+      let prompt = "";
+      try {
+        prompt = await composePrompt({
+          phase: run.phase,
+          task,
+          pmDir,
+          repoDir: project.repo_dir,
+          db: this.db,
+          projectId: project.id,
+        });
+        if (run.prompt) {
+          prompt += `\n\nUser instructions:\n${run.prompt}`;
         }
-        if (!isCompliant) {
-          prompt += "\n\npart of your job is to make this repo compliant — add the Dockerfile, compose environment with healthcheck, and (for UI projects) e2e tests.";
-        }
+      } catch (err) {
+        console.error("Failed to compose prompt, falling back:", err);
+        prompt = run.prompt || "";
       }
 
       // Call startRun
@@ -234,10 +230,29 @@ export class QueueManager {
         finishedAt: new Date().toISOString(),
       };
 
-      const pmDir = pmDirFor(project.repo_dir);
-      const task = await findTask(pmDir, run.task_num);
       if (task) {
         await addRunOutcome(task, frontMatter, finalOutcome, { num: startResult.runId });
+
+        if (status === "succeeded") {
+          if (run.phase === "interview") {
+            const questions = parseInterviewQuestions(finalOutcome);
+            for (const q of questions) {
+              this.db
+                .prepare(
+                  "INSERT INTO questions (project_id, task_num, run_id, text) VALUES (?, ?, ?, ?)"
+                )
+                .run(run.project_id, run.task_num, run.id, q);
+            }
+          } else if (run.phase === "refine") {
+            const cleanDescription = finalOutcome.trim();
+            await writeTaskDescription(task, cleanDescription);
+          } else if (run.phase === "plan") {
+            await writeFile(join(task.dir, "plan.md"), finalOutcome, "utf8");
+          } else if (run.phase === "review") {
+            await moveTaskStatus(pmDir, task, "ready-for-review");
+          }
+        }
+
         await reindexTask(this.db, { id: project.id, repoDir: project.repo_dir }, task.id);
         // Stage, commit, and push metadata on the default branch
         await client.call("commitAndPush", { branch: "" });

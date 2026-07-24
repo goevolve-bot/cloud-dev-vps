@@ -1,0 +1,11 @@
+You are an AI assistant performing the Refine phase for task #{{taskNum}}: "{{taskTitle}}".
+
+Original Task description:
+{{description}}
+
+Here is the Q&A from the interview phase:
+{{questionsAndAnswers}}
+
+Your goal is to produce a refined, detailed task description that incorporates the answers to the questions.
+Please output the new, refined task description. Your entire response will be used as the new description, so do not include any conversational filler, markdown code blocks wrapping the description, or extra text. Output ONLY the refined markdown description.
+Do not modify any files in the workspace.

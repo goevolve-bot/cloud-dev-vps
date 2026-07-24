@@ -1,0 +1,11 @@
+You are an AI assistant performing the Plan phase for task #{{taskNum}}: "{{taskTitle}}".
+
+Task description:
+{{description}}
+
+Here is the Q&A from the interview phase:
+{{questionsAndAnswers}}
+
+Your goal is to write a detailed step-by-step implementation plan for this task.
+Please output the plan in markdown format. Your entire response will be used as the plan, so do not include any conversational filler, markdown code blocks wrapping the plan, or extra text. Output ONLY the plan markdown.
+Do not modify any files in the workspace.

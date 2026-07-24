@@ -6,11 +6,13 @@ import {
   fetchTaskDetails,
   createRun,
   stopRun,
+  answerQuestion,
   type Task,
   type TaskStatus,
   type Comment as ApiComment,
   type TaskRun,
   type QueueRun,
+  type Question,
 } from "../api";
 import { useAttachments } from "../hooks/useAttachments";
 import { AttachmentsBar } from "./AttachmentsBar";
@@ -206,6 +208,86 @@ function ArtifactsGallery({ project, taskId, runNum }: ArtifactsGalleryProps) {
   );
 }
 
+interface InlineQuestionsProps {
+  readonly questions: Question[];
+  readonly onAnswer: (id: number, text: string) => Promise<void>;
+}
+
+function InlineQuestions({ questions, onAnswer }: InlineQuestionsProps) {
+  const [answers, setAnswers] = useState<Record<number, string>>({});
+  const [submitting, setSubmitting] = useState<Record<number, boolean>>({});
+
+  if (questions.length === 0) return null;
+
+  return (
+    <div style={{
+      marginTop: "10px",
+      padding: "10px 15px",
+      borderRadius: "6px",
+      background: "var(--surface2)",
+      border: "1px solid var(--border)",
+    }}>
+      <h5 style={{ margin: "0 0 10px 0", fontSize: "11px", fontWeight: "600", color: "var(--muted)", letterSpacing: "0.5px" }}>CLARIFICATION QUESTIONS</h5>
+      <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+        {questions.map((q) => {
+          const draft = answers[q.id] ?? "";
+          const isPending = !q.answer;
+          const loading = submitting[q.id] || false;
+
+          return (
+            <li key={q.id} style={{ marginBottom: "12px", borderBottom: isPending ? "none" : "1px solid var(--border)", paddingBottom: isPending ? 0 : "8px" }}>
+              <div style={{ fontWeight: "500", fontSize: "13px", marginBottom: "4px" }}>
+                Q: {q.text}
+              </div>
+              {isPending ? (
+                <div style={{ display: "flex", gap: "8px", marginTop: "6px" }}>
+                  <input
+                    type="text"
+                    placeholder="Provide your answer..."
+                    value={draft}
+                    onChange={(e) => setAnswers({ ...answers, [q.id]: e.target.value })}
+                    style={{
+                      flex: 1,
+                      padding: "4px 8px",
+                      borderRadius: "4px",
+                      border: "1px solid var(--border)",
+                      background: "var(--surface)",
+                      color: "var(--ink)",
+                      fontSize: "12px",
+                    }}
+                    disabled={loading}
+                  />
+                  <button
+                    type="button"
+                    className="chip solid"
+                    style={{ fontSize: "11px", padding: "4px 10px" }}
+                    onClick={async () => {
+                      if (!draft.trim()) return;
+                      setSubmitting({ ...submitting, [q.id]: true });
+                      try {
+                        await onAnswer(q.id, draft);
+                      } finally {
+                        setSubmitting({ ...submitting, [q.id]: false });
+                      }
+                    }}
+                    disabled={loading || !draft.trim()}
+                  >
+                    {loading ? "Submitting..." : "Submit"}
+                  </button>
+                </div>
+              ) : (
+                <div style={{ fontSize: "12px", color: "var(--muted)", fontStyle: "italic", marginLeft: "10px" }}>
+                  A: {q.answer} <span style={{ fontSize: "10px", color: "var(--muted)" }}>({new Date(q.answered_at!).toLocaleString()})</span>
+                </div>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
 export interface TaskViewProps {
   readonly task: Task;
   readonly project: string;
@@ -223,6 +305,8 @@ export function TaskView({ task, project, onSave, onStatusChange }: TaskViewProp
   const [comments, setComments] = useState<ApiComment[]>([]);
   const [taskRuns, setTaskRuns] = useState<TaskRun[]>([]);
   const [queueRuns, setQueueRuns] = useState<QueueRun[]>([]);
+  const [questions, setQuestions] = useState<Question[]>([]);
+  const [plan, setPlan] = useState<string | null>(null);
 
   const [runPhase, setRunPhase] = useState("implement");
   const [runProvider, setRunProvider] = useState("claude");
@@ -240,6 +324,8 @@ export function TaskView({ task, project, onSave, onStatusChange }: TaskViewProp
         setComments(details.comments);
         setTaskRuns(details.runs);
         setQueueRuns(details.queueRuns);
+        setQuestions(details.questions || []);
+        setPlan(details.plan || null);
       } catch (err) {
         console.error("Failed to load details", err);
       }
@@ -265,6 +351,8 @@ export function TaskView({ task, project, onSave, onStatusChange }: TaskViewProp
       setComments(details.comments);
       setTaskRuns(details.runs);
       setQueueRuns(details.queueRuns);
+      setQuestions(details.questions || []);
+      setPlan(details.plan || null);
     } catch (err) {
       alert(`Failed to launch run: ${err}`);
     } finally {
@@ -279,8 +367,24 @@ export function TaskView({ task, project, onSave, onStatusChange }: TaskViewProp
       setComments(details.comments);
       setTaskRuns(details.runs);
       setQueueRuns(details.queueRuns);
+      setQuestions(details.questions || []);
+      setPlan(details.plan || null);
     } catch (err) {
       alert(`Failed to stop run: ${err}`);
+    }
+  }
+
+  async function handleAnswerQuestion(questionId: number, answerText: string) {
+    try {
+      await answerQuestion(questionId, answerText);
+      const details = await fetchTaskDetails(project, task.id);
+      setComments(details.comments);
+      setTaskRuns(details.runs);
+      setQueueRuns(details.queueRuns);
+      setQuestions(details.questions || []);
+      setPlan(details.plan || null);
+    } catch (err) {
+      alert(`Failed to submit answer: ${err}`);
     }
   }
 
@@ -366,7 +470,7 @@ export function TaskView({ task, project, onSave, onStatusChange }: TaskViewProp
 
   return (
     <main className="main">
-      <div className="trow-head">
+      <div className="trow-head" style={{ display: "flex", alignItems: "center", gap: "10px" }}>
         <strong>
           #{task.id} {task.title}
         </strong>
@@ -383,6 +487,16 @@ export function TaskView({ task, project, onSave, onStatusChange }: TaskViewProp
           ))}
         </select>
         {task.branch && <span className="chip mono">{task.branch}</span>}
+        {task.status === "ready-for-review" && (
+          <button
+            type="button"
+            className="chip solid"
+            style={{ background: "#0f766e", color: "#fff", fontWeight: "600" }}
+            onClick={() => void onStatusChange("done")}
+          >
+            Accept Task
+          </button>
+        )}
       </div>
 
       {/* LAUNCH BAR */}
@@ -515,6 +629,18 @@ export function TaskView({ task, project, onSave, onStatusChange }: TaskViewProp
         />
       </div>
 
+      {/* PLAN */}
+      {plan && (
+        <div className="desc" style={{ marginTop: "15px" }}>
+          <div className="desc-head">
+            <span className="muted small-label">IMPLEMENTATION PLAN</span>
+          </div>
+          <div style={{ padding: "10px 15px", background: "var(--surface)" }}>
+            <Markdown text={plan} />
+          </div>
+        </div>
+      )}
+
       {/* TIMELINE */}
       <div className="timeline">
         <span className="muted small-label">TIMELINE</span>
@@ -536,6 +662,13 @@ export function TaskView({ task, project, onSave, onStatusChange }: TaskViewProp
             );
           } else if (item.type === "run") {
             const r = item.data as TaskRun;
+            const matchedQueueRun = queueRuns.find(
+              (q) => q.phase === r.phase && q.started_at === r.started_at
+            );
+            const runQuestions = matchedQueueRun
+              ? questions.filter((qn) => qn.run_id === matchedQueueRun.id)
+              : [];
+
             return (
               <div key={`r-${r.id}-${index}`} className="timeline-entry run">
                 <div className="timeline-entry-header">
@@ -554,6 +687,9 @@ export function TaskView({ task, project, onSave, onStatusChange }: TaskViewProp
                   {r.phase === "verify" && (
                     <ArtifactsGallery project={project} taskId={task.id} runNum={r.run_num} />
                   )}
+                  {runQuestions.length > 0 && (
+                    <InlineQuestions questions={runQuestions} onAnswer={handleAnswerQuestion} />
+                  )}
                 </div>
               </div>
             );
@@ -567,6 +703,8 @@ export function TaskView({ task, project, onSave, onStatusChange }: TaskViewProp
             if (existsInTaskRuns && q.status !== "running" && q.status !== "queued") {
               return null;
             }
+
+            const runQuestions = questions.filter((qn) => qn.run_id === q.id);
 
             return (
               <div key={`q-${q.id}-${index}`} className="timeline-entry run">
@@ -596,6 +734,9 @@ export function TaskView({ task, project, onSave, onStatusChange }: TaskViewProp
                     </div>
                   )}
                   {q.status === "running" && <LiveLogs runId={q.id} />}
+                  {runQuestions.length > 0 && (
+                    <InlineQuestions questions={runQuestions} onAnswer={handleAnswerQuestion} />
+                  )}
                 </div>
               </div>
             );

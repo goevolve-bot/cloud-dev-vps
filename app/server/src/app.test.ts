@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import type { FastifyInstance } from "fastify";
+import type Database from "better-sqlite3";
 import { buildApp } from "./app.js";
 import { openDb } from "./db/connection.js";
 import { migrateUp } from "./db/migrate.js";
@@ -12,6 +13,7 @@ import { RunnerRegistry } from "./runners/registry.js";
 interface Fixture {
   readonly app: FastifyInstance;
   readonly repoDir: string;
+  readonly db: Database.Database;
 }
 
 async function withApp(fn: (fx: Fixture) => Promise<void>): Promise<void> {
@@ -33,7 +35,7 @@ async function withApp(fn: (fx: Fixture) => Promise<void>): Promise<void> {
   await runners.start();
   const app = buildApp({ db, runners });
   try {
-    await fn({ app, repoDir });
+    await fn({ app, repoDir, db });
   } finally {
     await app.close();
     runners.stop();
@@ -301,3 +303,73 @@ test("runs queue endpoints create, list, and stop queued runs", () =>
     });
     assert.equal(listResAfter.json().runs[0].status, "cancelled");
   }));
+
+test("answering questions and retrieving specs/ADRs", () =>
+  withApp(async ({ app, repoDir, db }) => {
+    const created = await createTaskViaApi(app, { title: "Auth Task", description: "basic auth" });
+    const taskNum = created.task.id;
+
+    // Insert mock run and question
+    db.prepare(
+      "INSERT INTO runs (id, project_id, task_num, phase, provider, model, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(101, 1, taskNum, "interview", "claude", "claude-3-5", "succeeded", "2026-01-01T00:00:00Z");
+
+    const questionResult = db.prepare(
+      "INSERT INTO questions (project_id, task_num, run_id, text) VALUES (?, ?, ?, ?)"
+    ).run(1, taskNum, 101, "Should we use JWT?");
+    const questionId = questionResult.lastInsertRowid;
+
+    // Answer the question
+    const answerRes = await app.inject({
+      method: "POST",
+      url: `/api/questions/${questionId}/answer`,
+      payload: { answer: "Yes, use JWT" },
+    });
+    assert.equal(answerRes.statusCode, 200);
+    assert.equal(answerRes.json().question.answer, "Yes, use JWT");
+
+    // Fetch task detail and verify questions are present
+    const detailRes = await app.inject({
+      method: "GET",
+      url: `/api/projects/demo/tasks/${taskNum}`,
+    });
+    assert.equal(detailRes.statusCode, 200);
+    const detail = detailRes.json();
+    assert.equal(detail.questions.length, 1);
+    assert.equal(detail.questions[0].text, "Should we use JWT?");
+    assert.equal(detail.questions[0].answer, "Yes, use JWT");
+
+    // Write mock specs and ADRs
+    const specsDir = join(repoDir, ".pm", "specs");
+    const adrsDir = join(repoDir, ".pm", "adrs");
+    await mkdir(specsDir, { recursive: true });
+    await mkdir(adrsDir, { recursive: true });
+
+    await writeFile(join(specsDir, "auth.md"), "# Auth Spec\nJWT details.\n");
+    await writeFile(
+      join(adrsDir, "0001-setup.md"),
+      "---\nid: 1\ntitle: Setup Auth\nstatus: accepted\nsupersededBy: null\n---\n# Setup Auth\n"
+    );
+
+    // Fetch specs list
+    const specsRes = await app.inject({
+      method: "GET",
+      url: "/api/projects/demo/specs",
+    });
+    assert.equal(specsRes.statusCode, 200);
+    assert.equal(specsRes.json().specs.length, 1);
+    assert.equal(specsRes.json().specs[0].name, "auth");
+    assert.match(specsRes.json().specs[0].body, /JWT details/);
+
+    // Fetch ADRs list
+    const adrsRes = await app.inject({
+      method: "GET",
+      url: "/api/projects/demo/adrs",
+    });
+    assert.equal(adrsRes.statusCode, 200);
+    assert.equal(adrsRes.json().adrs.length, 1);
+    assert.equal(adrsRes.json().adrs[0].id, 1);
+    assert.equal(adrsRes.json().adrs[0].title, "Setup Auth");
+    assert.match(adrsRes.json().adrs[0].body, /Setup Auth/);
+  }));
+

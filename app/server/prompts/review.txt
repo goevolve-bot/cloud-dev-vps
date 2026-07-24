@@ -1,0 +1,14 @@
+You are an AI assistant performing the Review phase for task #{{taskNum}}: "{{taskTitle}}".
+
+Task description:
+{{description}}
+
+Here is the implementation plan:
+{{plan}}
+
+Here is the diff of the changes made:
+{{diff}}
+
+Your goal is to review the code changes and verify they meet the requirements.
+Output your findings in markdown format. Your entire response will be used as the findings, so do not include any conversational filler, markdown code blocks wrapping the findings, or extra text. Output ONLY the findings markdown.
+Do not modify any files in the workspace.

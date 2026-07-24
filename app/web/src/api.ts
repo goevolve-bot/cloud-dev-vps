@@ -191,11 +191,36 @@ export async function createComment(
   return body.comments;
 }
 
+export interface Question {
+  readonly id: number;
+  readonly project_id: number;
+  readonly task_num: number;
+  readonly run_id: number;
+  readonly text: string;
+  readonly answer: string | null;
+  readonly answered_at: string | null;
+}
+
+export interface Spec {
+  readonly name: string;
+  readonly body: string;
+  readonly path: string;
+}
+
+export interface Adr {
+  readonly id: number;
+  readonly title: string;
+  readonly status: "accepted" | "superseded" | "abandoned";
+  readonly supersededBy: number | null;
+  readonly body: string;
+  readonly path: string;
+}
+
 export async function fetchTaskDetails(
   project: string,
   taskId: number,
-): Promise<{ task: Task; comments: Comment[]; runs: TaskRun[]; queueRuns: QueueRun[] }> {
-  return getJson<{ task: Task; comments: Comment[]; runs: TaskRun[]; queueRuns: QueueRun[] }>(
+): Promise<{ task: Task; comments: Comment[]; runs: TaskRun[]; queueRuns: QueueRun[]; questions: Question[]; plan: string | null }> {
+  return getJson<{ task: Task; comments: Comment[]; runs: TaskRun[]; queueRuns: QueueRun[]; questions: Question[]; plan: string | null }>(
     `/api/projects/${project}/tasks/${taskId}`,
   );
 }
@@ -220,4 +245,23 @@ export async function stopRun(runId: number): Promise<boolean> {
   }
   const body = (await response.json()) as { stopped: boolean };
   return body.stopped;
+}
+
+export async function answerQuestion(questionId: number, answer: string): Promise<Question> {
+  const body = await sendJson<{ question: Question }>(
+    `/api/questions/${questionId}/answer`,
+    "POST",
+    { answer },
+  );
+  return body.question;
+}
+
+export async function fetchSpecs(project: string): Promise<Spec[]> {
+  const body = await getJson<{ specs: Spec[] }>(`/api/projects/${project}/specs`);
+  return body.specs;
+}
+
+export async function fetchAdrs(project: string): Promise<Adr[]> {
+  const body = await getJson<{ adrs: Adr[] }>(`/api/projects/${project}/adrs`);
+  return body.adrs;
 }
