@@ -191,13 +191,57 @@
     dest: "/home/{{ pm_user }}/.docker/cli-plugins/docker-compose"
     mode: "0755"
 
+# RootlessKit's default "builtin" port driver terminates the inbound TCP
+# connection on the host and opens a fresh one into the container, so nginx saw
+# the bridge gateway (172.18.0.1) as $remote_addr for *every* request. That
+# quietly disabled the whole realip block in nginx.conf.j2: set_real_ip_from
+# lists Cloudflare's ranges, none of which ever matched, so CF-Connecting-IP
+# was never honoured and access logs recorded 172.18.0.1 for all traffic. The
+# slirp4netns port driver preserves the original source address, which is what
+# makes "trust CF-Connecting-IP only from Cloudflare" an enforceable statement
+# rather than a comment.
+- name: Ensure a systemd drop-in directory for the pm user's docker service
+  file:
+    path: "/home/{{ pm_user }}/.config/systemd/user/docker.service.d"
+    state: directory
+    owner: "{{ pm_user }}"
+    group: "{{ pm_group }}"
+    mode: "0755"
+
+- name: Make rootless Docker preserve the client source address
+  copy:
+    dest: "/home/{{ pm_user }}/.config/systemd/user/docker.service.d/port-driver.conf"
+    owner: "{{ pm_user }}"
+    group: "{{ pm_group }}"
+    mode: "0644"
+    content: |
+      # Managed by roles/pm — see the comment in tasks/base.yml §8.
+      [Service]
+      Environment=DOCKERD_ROOTLESS_ROOTLESSKIT_PORT_DRIVER=slirp4netns
+  register: pm_docker_port_driver
+  # Restarting the daemon takes its containers down with it, and
+  # pm-compose.service is RemainAfterExit — it would still read `active` with
+  # nothing running.
+  notify: restart pm compose
+
+- name: Reload the pm user's systemd manager after the drop-in
+  become: true
+  become_user: "{{ pm_user }}"
+  systemd:
+    daemon_reload: true
+    scope: user
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ pm_user_uid }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ pm_user_uid }}/bus"
+  when: pm_docker_port_driver.changed
+
 - name: Enable and start rootless Docker user service for pm user
   become: true
   become_user: "{{ pm_user }}"
   systemd:
     name: docker
     scope: user
-    state: started
+    state: "{{ 'restarted' if pm_docker_port_driver.changed else 'started' }}"
     enabled: true
   environment:
     XDG_RUNTIME_DIR: "/run/user/{{ pm_user_uid }}"

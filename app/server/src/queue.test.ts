@@ -342,6 +342,16 @@ test("an implement run carries pm's run id, pushes its branch, and queues verify
       .prepare("SELECT * FROM runs WHERE project_id = ? AND phase = 'verify'")
       .get(projectId) as RunRow | undefined;
     assert.ok(verify, "a verify run is queued after a successful implement run");
+
+    // The branch has to be recorded by pm, not by the runner: `.pm/` is
+    // pm-owned on the host and project users are never in the pm group, so
+    // the runner's attempt failed with EACCES on every run and the task's
+    // front matter kept saying `branch: null`.
+    const onDisk = await readFile(
+      join(repo.dir, ".pm", "tasks", "in-progress", "0001-demo", "index.md"),
+      "utf8",
+    );
+    assert.match(onDisk, /^branch: pm\/task-1-demo$/m);
   } finally {
     // No db.close(): the queue polls it, and a stopped queue can still have
     // one parked run holding a reference.

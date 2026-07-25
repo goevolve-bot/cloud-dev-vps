@@ -9,6 +9,7 @@ import {
   findTask,
   writeTaskDescription,
   moveTaskStatus,
+  setTaskBranch,
   type RunEvent,
   type TaskStatus,
 } from "@pm/core";
@@ -48,6 +49,37 @@ function runTimeoutMs(project: { run_timeout_ms?: number | null }): number {
 
 function maxConcurrentRuns(): number {
   return envNumber("PM_MAX_CONCURRENT_RUNS", DEFAULT_MAX_CONCURRENT_RUNS);
+}
+
+/**
+ * Bring a stopped project's runner back up and wait for its socket.
+ *
+ * Both callers need it for the same reason: everything that touches the
+ * project's git tree — starting a run, committing the task board — goes
+ * through the runner, because the pm image deliberately has no git. A project
+ * that has idled out has no runner, so without this the operation either fails
+ * or, worse, silently does nothing.
+ *
+ * Resolves true once the runner is connected. Never throws: callers decide
+ * whether an unreachable runner is fatal.
+ */
+export async function ensureRunnerConnected(
+  runners: RunnerRegistry,
+  projectName: string,
+  timeoutMs = 10000,
+): Promise<boolean> {
+  if (runners.state(projectName) === "connected") return true;
+  try {
+    await callProjectctl("start", { name: projectName });
+  } catch {
+    return false;
+  }
+  let elapsed = 0;
+  while (runners.state(projectName) !== "connected" && elapsed < timeoutMs) {
+    await new Promise((r) => setTimeout(r, 100));
+    elapsed += 100;
+  }
+  return runners.state(projectName) === "connected";
 }
 
 // ─── Idle-timeout watcher (T35) ──────────────────────────────────────────────
@@ -314,16 +346,8 @@ export class QueueManager {
 
       // Auto-activate project if stopped; cancel any pending idle timer
       cancelIdleTimer(project.id);
-      if (this.runners.state(project.name) !== "connected") {
-        await callProjectctl("start", { name: project.name });
-        let elapsed = 0;
-        while (this.runners.state(project.name) !== "connected" && elapsed < 10000) {
-          await new Promise((r) => setTimeout(r, 100));
-          elapsed += 100;
-        }
-        if (this.runners.state(project.name) !== "connected") {
-          throw new Error("Failed to activate project runner");
-        }
+      if (!(await ensureRunnerConnected(this.runners, project.name))) {
+        throw new Error("Failed to activate project runner");
       }
       // A project can already be 'connected' but sitting in 'idle' (timer
       // pending, no runner restart needed) — mark it active unconditionally
@@ -380,6 +404,21 @@ export class QueueManager {
         prompt,
         timeoutMs: runTimeoutMs(project),
       });
+
+      // startRun resolves once the worktree (and so the branch) exists, so
+      // this is the first honest moment to record it — and pm has to be the
+      // one to do it. The runner tried, and could not: `.pm` files are created
+      // by pm, which is `pm:pm 0644` on the host, and project users are
+      // deliberately never in the `pm` group (see the socket permissions in
+      // the runbook's security notes). Every implement run therefore logged
+      // EACCES into the runner's journal and left `branch: null` on the task,
+      // which is why the branch chip never rendered.
+      if (run.phase === "implement") {
+        const branch = `pm/task-${currentTask.id}-${currentTask.slug}`;
+        if (currentTask.branch !== branch) {
+          currentTask = await setTaskBranch(currentTask, branch);
+        }
+      }
 
       const logDir = join(process.env.PM_DATA_DIR || ".", "logs");
       await mkdir(logDir, { recursive: true });

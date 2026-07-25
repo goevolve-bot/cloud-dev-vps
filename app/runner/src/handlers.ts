@@ -11,7 +11,6 @@ import {
   findTask,
   getAdapter,
   pmDirFor,
-  setTaskBranch,
   type RunnerEvent,
   type RunnerVerb,
   type RunnerVerbs,
@@ -818,17 +817,29 @@ async function executeVerify(opts: {
 
 // ─── Agent containers ────────────────────────────────────────────────────────
 
-function agentDockerArgs(opts: {
+export function agentDockerArgs(opts: {
   readonly containerName: string;
   readonly workspaceDir: string;
   readonly cmd: readonly string[];
   readonly network?: string | null;
+  readonly gitCommonDir?: string | null;
 }): string[] {
   const args = [
     "run",
     "--name",
     opts.containerName,
     "--rm",
+    // Both CLIs refuse `--dangerously-skip-permissions` when euid is 0, and
+    // the agent runs as container root by necessity: under rootless Docker,
+    // container root is the *project user* on the host, which is the only uid
+    // that can write the bind-mounted workspace. Running as a non-root uid
+    // inside would map to a subuid with no access to its own checkout.
+    // IS_SANDBOX is the CLIs' own escape hatch for exactly this case, and the
+    // assertion it makes is true here: the container is disposable (--rm),
+    // has no host filesystem beyond the workspace, and talks only to the
+    // project's own rootless daemon.
+    "-e",
+    "IS_SANDBOX=1",
     "-v",
     `${opts.workspaceDir}:/workspace`,
     "-v",
@@ -839,6 +850,17 @@ function agentDockerArgs(opts: {
 
   if (opts.network) {
     args.push("--network", opts.network);
+  }
+
+  // The implement phase hands the agent a linked *worktree*, whose `.git` is a
+  // one-line file naming an absolute host path under the main checkout's .git.
+  // Mounting only the worktree therefore gave the agent a directory where
+  // every git command died with "fatal: not a git repository" — including the
+  // commit the implement prompt asks for. The common dir is mounted at the
+  // identical path it names, so the pointer resolves without rewriting it; the
+  // clone-based phases (verify, review) are self-contained and pass nothing.
+  if (opts.gitCommonDir) {
+    args.push("-v", `${opts.gitCommonDir}:${opts.gitCommonDir}`);
   }
 
   // Credentials reach the agent as a read-only mount, never on argv:
@@ -873,6 +895,7 @@ function spawnAgentContainer(opts: {
   readonly model: string;
   readonly prompt: string;
   readonly network?: string | null;
+  readonly gitCommonDir?: string | null;
 }): Promise<number | null> {
   const adapter = getAdapter(opts.provider);
   const cmd = adapter.containerCmd({ prompt: opts.prompt, model: opts.model });
@@ -881,6 +904,7 @@ function spawnAgentContainer(opts: {
     workspaceDir: opts.workspaceDir,
     cmd,
     network: opts.network,
+    gitCommonDir: opts.gitCommonDir,
   });
 
   const child = childProcess.spawn("docker", dockerArgs);
@@ -1201,15 +1225,13 @@ export const handlers: { [V in RunnerVerb]: Handler<V> } = {
 
     await prepareWorktree({ repoDir, workspaceDir, branchName, runId });
 
-    // The branch exists now, so the task's front matter can name it (this is
-    // what makes the branch chip render in the task header).
-    if (task.branch !== branchName) {
-      try {
-        await setTaskBranch(task as TaskRecord, branchName);
-      } catch (err) {
-        console.error(`run ${runId} could not record branch on task ${task.id}:`, err);
-      }
-    }
+    // The branch is recorded on the task by pm, not here. Everything under
+    // `.pm/` is created by the pm server and lands `pm:pm 0644` on the host,
+    // and project users are deliberately never in the `pm` group — so this
+    // side can read that tree but never write it. The attempt that used to
+    // live here failed with EACCES on every single implement run, and because
+    // it was caught and logged to the journal the only visible symptom was a
+    // task whose branch stayed null forever.
 
     const containerName = `pm-agent-run-${runId}`;
     activeRuns.set(runId, {
@@ -1232,6 +1254,9 @@ export const handlers: { [V in RunnerVerb]: Handler<V> } = {
       provider,
       model,
       prompt,
+      // workspaceDir is a linked worktree; without its common dir the agent
+      // has no git at all. See agentDockerArgs.
+      gitCommonDir: join(repoDir, ".git"),
     }).then(async (code) => {
       clearTimeout(timer);
       activeRuns.delete(runId);

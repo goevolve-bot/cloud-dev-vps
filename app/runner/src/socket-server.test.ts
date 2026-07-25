@@ -279,7 +279,13 @@ test("concurrent runs on different tasks get distinct log files and container na
   assert.deepEqual(names, ["pm-agent-run-101", "pm-agent-run-102"]);
 });
 
-test("startRun records the branch on the task", async () => {
+test("startRun leaves the task's front matter alone — pm owns .pm/", async () => {
+  // This used to assert the opposite, and passed, because a unit test writes
+  // into a temp dir it owns. On a real host `.pm/` is created by the pm server
+  // and lands `pm:pm 0644`, while the runner is the project user, which is
+  // deliberately never in the `pm` group — so the write failed with EACCES on
+  // every implement run and the task's branch stayed null. Recording it is
+  // pm's job now (see queue.ts); the runner must not try.
   await startRun({ runId: 55, taskId: 3 });
   await call({ id: "w55", verb: "streamLogs", args: { runId: 55 } });
 
@@ -287,7 +293,7 @@ test("startRun records the branch on the task", async () => {
     join(repoDir, ".pm", "tasks", "todo", "0003-third", "index.md"),
     "utf8",
   );
-  assert.match(index, /branch: pm\/task-3-third/);
+  assert.match(index, /branch: null/);
 });
 
 test("startRun commits a dirty worktree instead of resetting it away", async () => {

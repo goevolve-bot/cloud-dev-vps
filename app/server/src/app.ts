@@ -24,7 +24,7 @@ import {
 } from "@pm/core";
 import { rebuildIndex, reindexTask } from "./indexer/index.js";
 import type { RunnerRegistry } from "./runners/registry.js";
-import { QueueManager, sseEmitter } from "./queue.js";
+import { QueueManager, ensureRunnerConnected, sseEmitter } from "./queue.js";
 import { callProjectctl } from "./projectctl.js";
 
 export interface AppContext {
@@ -287,11 +287,17 @@ export function buildApp(ctx: AppContext): FastifyInstance {
   /**
    * .pm/ writes commit on the runner's pinned default-branch checkout, not a
    * task branch — the exact branch-name contract for that call is T22's job.
-   * commitAndPush is still stubbed (T10), so this is inherently best-effort:
-   * a task/comment always lands on disk and in the cache even if nothing is
-   * connected yet to push it.
+   * Best-effort in the sense that a task/comment always lands on disk and in
+   * the cache even if the push cannot happen; it is *not* best-effort about
+   * trying. A project that has idled out has no runner, and the runner is the
+   * only thing on the host that has git, so without waking it first every
+   * board write made against an idle project returned `pushed: false` and the
+   * board silently diverged from origin until some later run happened to
+   * commit it. Waking costs a cold start on the first write; the project is
+   * already active for every write after it.
    */
   async function commitAndPushBestEffort(projectName: string): Promise<boolean> {
+    if (!(await ensureRunnerConnected(runners, projectName))) return false;
     const client = runners.client(projectName);
     if (!client) return false;
     try {

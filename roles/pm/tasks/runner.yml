@@ -147,3 +147,30 @@
 - name: Verify the runner tree is reachable by a non-pm account
   command: "runuser -u nobody -- test -r {{ pm_app_dest }}/runner/dist/index.js"
   changed_when: false
+
+# ── 5. Bounce project runners onto the build that just replaced their code ─
+# The unit's ExecStart is a path, not a copy: rebuilding dist/ under a live
+# runner leaves that process serving the *old* module graph until something
+# restarts it. Nothing did — `restart pm compose` only covers the pm server —
+# so a fix could deploy cleanly and still not be running, and the only symptom
+# was the bug still happening. This cost a full debug cycle on 2026-07-25.
+#
+# try-restart, not restart: a project that has idled out stays down and picks
+# the new build up on its next run, so a deploy never boots a rootless dockerd
+# just to stop it again 15 minutes later.
+- name: Restart running project runners onto the new build
+  shell: |
+    set -eu
+    restarted=""
+    for unit in /home/pm-*/.config/systemd/user/runner.service; do
+      [ -e "$unit" ] || continue
+      user=$(printf '%s' "$unit" | cut -d/ -f3)
+      # try-restart exits 0 on an inactive unit too, so ask first — otherwise
+      # every deploy reports a change for every project that exists.
+      systemctl --machine "${user}@.host" --user is-active --quiet runner.service || continue
+      systemctl --machine "${user}@.host" --user try-restart runner.service
+      restarted="$restarted $user"
+    done
+    printf 'restarted:%s\n' "$restarted"
+  register: pm_runner_restart
+  changed_when: pm_runner_restart.stdout_lines[-1] != "restarted:"

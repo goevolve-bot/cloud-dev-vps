@@ -207,6 +207,37 @@ test("creating a task writes it to .pm/ on disk and into the cache", () =>
     assert.equal(list.json().tasks.length, 1);
   }));
 
+test("creating a task wakes an idled project rather than skipping the push", () =>
+  withApp(async ({ app }) => {
+    // The board is versioned with the code, so a task is a commit — but only
+    // the runner has git, and an idled project has no runner. Before this,
+    // every board write against an idle project returned pushed:false and the
+    // board diverged from origin until some later run happened to commit it.
+    const stub = await startProjectctlStub((verb) =>
+      verb === "start"
+        ? { ok: true, data: {} }
+        : { ok: false, code: "unexpected_verb", message: verb },
+    );
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/projects/demo/tasks",
+        payload: { title: "Woken", description: "Should try to wake the runner." },
+      });
+      assert.equal(response.statusCode, 201);
+      assert.deepEqual(
+        stub.calls.map((c) => c.verb),
+        ["start"],
+      );
+      assert.equal(stub.calls[0].args.name, "demo");
+      // The stub has no runner socket to offer, so the push still cannot
+      // happen — but the attempt is reported honestly rather than skipped.
+      assert.equal(response.json().pushed, false);
+    } finally {
+      await stub.close();
+    }
+  }));
+
 test("creating a task rejects a missing title or description", () =>
   withApp(async ({ app }) => {
     const response = await app.inject({

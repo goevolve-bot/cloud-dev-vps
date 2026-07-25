@@ -9,6 +9,13 @@
 > were needed to get from a bare host to a passing verify. What broke, and why,
 > is recorded in §7 rather than quietly fixed, because every one of those
 > failures is a thing a future deploy can hit again.
+>
+> A second pass the same day added the provider credential and ran the agent
+> phases — interview, plan, implement, review — plus the public Cloudflare
+> path. That took six more failures, in §7b. The first pass had confirmed
+> everything *downstream* of the agent container; it turned out the container
+> itself could not start, could not use git, and could not write the one field
+> it was supposed to set.
 
 ---
 
@@ -203,7 +210,13 @@ the value's own prefix, because the CLI reads them from different places:
 | anything else (console API key) | `ANTHROPIC_API_KEY` |
 
 Getting this wrong does not fail loudly — an OAuth token exported as
-`ANTHROPIC_API_KEY` 401s on every call.
+`ANTHROPIC_API_KEY` 401s on every call. The `sk-ant-oat…` branch is the one
+that has been exercised on the host; the console-key branch has not.
+
+Setting a credential seeds it into every existing project user and into any
+project created later, so `{"ok":true,…,"projectsUpdated":N}` should name every
+project you have. Confirm it landed with
+`ls -l /home/pm-<name>/.pm-creds/` — `0600`, owned by the project user.
 
 **Antigravity.** There is no API key. `agy` authenticates from a JSON OAuth
 document that it writes during an interactive Google login, so the value to
@@ -276,25 +289,103 @@ exit code, so this costs reporting detail, not correctness.
 
 ---
 
+## 7b. What broke the first time an agent actually ran
+
+Added 2026-07-25, from the session that closed §8's first two items. Every one
+of these was invisible until a real credential let the agent container start,
+and the first four are fatal on any fresh deploy of the pre-2026-07-25 tree.
+Note the pattern: three of the six failed *silently*, and the two worst were
+caught only by reading the runner's journal.
+
+**7.7 Both CLIs refuse `--dangerously-skip-permissions` as root.** Every
+implement run died 1.5 s in with a single line on stderr —
+`--dangerously-skip-permissions cannot be used with root/sudo privileges for
+security reasons` — and was recorded as an ordinary failed run. The agent
+*must* be container root: under rootless Docker container root maps to the
+project user on the host, which is the only uid that can write the bind-mounted
+workspace. `IS_SANDBOX=1` is the CLIs' own escape hatch for this case and the
+container genuinely satisfies it, so `agentDockerArgs` now sets it.
+
+**7.8 The agent container had no git at all.** The implement phase hands the
+agent a linked *worktree*, whose `.git` is a one-line file naming an absolute
+host path (`<repo>/.git/worktrees/<name>`) that was not mounted. Every git
+command inside the container failed with `fatal: not a git repository`, so the
+agent could not do the commit its own prompt asks for. `agentDockerArgs` now
+mounts the repo's git common dir at the identical path it names. The
+clone-based phases (verify, review) were never affected — their checkouts are
+self-contained.
+
+This one hid behind a backstop: `commitAndPush` stages leftover changes, so the
+run still "succeeded", the branch still reached origin, and the only trace was
+that the commit message was pm's rather than the agent's.
+
+**7.9 `task.branch` could never be recorded.** The runner called
+`setTaskBranch` and it failed with `EACCES` on every implement run, caught and
+logged to a journal nobody reads. `.pm/` is created by the pm server and lands
+`pm:pm 0644` on the host; project users are deliberately never in the `pm`
+group (§11), so the runner can read that tree but never write it. Recording the
+branch is now pm's job, in `queue.ts`, right after `startRun` returns. The
+runner-side test that "proved" the old behaviour passed only because a unit
+test writes into a temp dir it owns.
+
+**7.10 A rebuilt runner kept serving the old code.** The runner unit's
+`ExecStart` is a path into `/srv/pm/app/runner/dist`, and the only restart
+handler in the role covers the pm server. Rebuilding under a live runner left
+it serving the previous module graph, so a deployed fix simply did not run —
+the symptom being the bug still happening. `roles/pm/tasks/runner.yml` now
+`try-restart`s each project runner that is actually up; idled projects pick the
+new build up on their next run.
+
+**7.11 Task-board writes were silently skipped for idle projects.** Only the
+runner has git, so `commitAndPushBestEffort` gave up when a project had idled
+out — `POST /tasks` returned `"pushed": false` and the board diverged from
+origin until some later run happened to commit it. It now wakes the runner
+first, sharing `ensureRunnerConnected` with the queue.
+
+**7.12 nginx never saw a real client IP.** RootlessKit's default `builtin` port
+driver terminates the inbound connection on the host and opens a fresh one into
+the container, so `$remote_addr` was the bridge gateway `172.18.0.1` for every
+request. That silently disabled the entire realip block: `set_real_ip_from`
+lists Cloudflare's ranges, none of which ever matched, so `CF-Connecting-IP` was
+never honoured. The pm user's docker now runs with
+`DOCKERD_ROOTLESS_ROOTLESSKIT_PORT_DRIVER=slirp4netns`, which preserves the
+source address — which is what makes "trust `CF-Connecting-IP` only from
+Cloudflare" an enforceable rule rather than a comment.
+
+---
+
 ## 8. What is still unproven
 
-Stated plainly rather than implied by omission.
+Stated plainly rather than implied by omission. Everything below the line was
+walked end to end on 2026-07-25 against `dev.goevolve.org`: task creation,
+interview, plan, implement, the auto-queued verify, and review — with a real
+Claude Code OAuth token, over the public Cloudflare path.
 
-- **The implement, plan and review phases have not been run.** They need a
-  provider credential, which was not available when this was written. Verify
-  was validated by pushing a `pm/task-1-*` branch by hand and triggering a
-  verify run against it. Everything downstream of the agent container —
-  cloning, compose orchestration, tests, artifacts, teardown, status
-  transitions — is confirmed; the agent container itself is not.
-- **`task.branch` stays `null` on this path.** It is set when an implement run
-  creates the branch, so a hand-pushed branch leaves it unset. Not a defect,
-  but it means the branch chip in the task header is also unconfirmed.
-- **The public Cloudflare path was not exercised.** Everything was verified over
-  loopback on the host. The nftables rules and nginx real-IP config are
-  deployed and correct by inspection, but no request has traversed Cloudflare.
 - **Antigravity has not been run end to end.** The flags, model ids and
-  credential path are now taken from the real CLI, but no agy run has executed
-  inside the agent container.
+  credential path are taken from the real CLI, but no `agy` run has ever
+  executed inside the agent container. Note that §7.7 applies to it too: the
+  `IS_SANDBOX` fix is set for every agent container, but only Claude Code's
+  root check has actually been observed passing. Antigravity also reports no
+  cost, because `agy --print` emits plain text (§7.6).
+- **Nothing has been driven through the web UI.** Every step above was done
+  over the API. The SPA is served and behind basic auth, but no button in it
+  has been clicked — so the task board, the branch chip, the run viewer and the
+  settings modal are unconfirmed as *UI*, even though the endpoints they call
+  are not.
+- **Only one project has ever existed.** Project-against-project isolation is
+  the security property the whole design is built around (separate users,
+  separate rootless daemons, separate credential mounts) and it has never been
+  exercised with two projects on one host.
+- **The `refine` phase has not been run.** It is the one phase with no
+  coverage on a real host.
+- **Artifact conversion beyond a text file is unconfirmed.** Verify collects
+  `/pm-artifacts` and the reference repo drops a `.txt` there. The
+  video→GIF conversion and screenshot-to-attachment paths have never had a
+  video or a screenshot to work on.
+- **Nothing has been observed under load or over time.** Concurrency is capped
+  at two runs and the cap is tested, but no two agent runs have ever been in
+  flight at once on the host, and `PM_DATA_DIR/artifacts` still has no
+  retention policy (see the TODO in `app.ts`).
 
 ---
 
@@ -330,9 +421,18 @@ existing project resumes rather than rebuilding.
 
 ## 11. Security notes
 
-- Provider credentials never appear in Ansible, in argv, or in plaintext in the
-  database. They reach the agent as a read-only mount, read inside the
-  container.
+- Provider credentials never appear in Ansible, on any argv, in any log, or in
+  the agent container's process arguments — verified on the host. They reach
+  the agent as a read-only mount, read inside the container by the shim.
+- pm **does** hold each credential in plaintext, in `provider_creds.secret` in
+  the SQLite DB under `/srv/pm/data`, owned by the `pm` user. This is
+  deliberate and the reasoning is in `db/migrations/0003_provider_cred_secret.ts`:
+  `pm-projectctl set-credential` is write-only, so there is nowhere else to
+  read the value back from when a project is created *after* the key was
+  entered. The isolation this system actually protects — project against
+  project — is unchanged, since a project user only ever sees its own
+  `~/.pm-creds`. An earlier version of this list claimed the opposite; it was
+  wrong.
 - `pm_auth_password` must be vault-encrypted before committing.
 - The self-signed origin cert covers the Cloudflare→origin leg only.
 - The `pm` group may connect to `pm-projectctl.socket`. Project users
