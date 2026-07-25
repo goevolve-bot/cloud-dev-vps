@@ -219,6 +219,7 @@ button {
 
 .mono {
   font-family: var(--mono);
+  overflow-wrap: anywhere;
 }
 
 .chip.solid {

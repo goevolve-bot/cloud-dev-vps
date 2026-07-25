@@ -17,6 +17,8 @@ Here are the relevant specs and ADRs:
 
 Your goal is to implement the task in the workspace. You should modify the files to implement the features described in the description and plan.
 
+The verify phase that runs next has no agent of its own — it only re-runs whatever `test` and `e2e` services already exist in this repo's compose setup. It will not notice new behavior unless you give it something to check. So as part of this task, add or extend a test that specifically exercises what you just built (a unit test, and — if the repo already has a `test`/`e2e` compose service — a case added to it, e.g. a request against the new endpoint and an assertion on its response). Do not leave verification of this task's behavior to a pre-existing generic check.
+
 When you are done, commit your work. The workspace is a git worktree already checked out on this task's branch, so:
 
 1. `git add -A` to stage everything you changed, including new files.

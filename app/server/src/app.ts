@@ -174,10 +174,15 @@ const PROVIDER_CREDENTIAL_KEYS: Record<string, string> = {
   antigravity: "antigravity",
 };
 
+// Real provider keys (Anthropic keys run 100+ chars) would otherwise render
+// a wall of asterisks that overflows the settings panel — cap the filler
+// regardless of the actual key length instead of mirroring it 1:1.
+const MASK_FILLER_MAX = 20;
+
 function maskKey(key: string): string {
-  return key.length > 8
-    ? `${key.slice(0, 4)}${"*".repeat(key.length - 8)}${key.slice(-4)}`
-    : "****";
+  if (key.length <= 8) return "****";
+  const filler = "*".repeat(Math.min(key.length - 8, MASK_FILLER_MAX));
+  return `${key.slice(0, 4)}${filler}${key.slice(-4)}`;
 }
 
 // A single path segment, no separators — closes off traversal outside the
