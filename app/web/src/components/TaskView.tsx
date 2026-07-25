@@ -393,7 +393,7 @@ export function TaskView({ task, project, projectInfo, onSave, onStatusChange }:
 
   async function handleAnswerQuestion(questionId: number, answerText: string) {
     try {
-      await answerQuestion(questionId, answerText);
+      await answerQuestion(project, task.id, questionId, answerText);
       const details = await fetchTaskDetails(project, task.id);
       setComments(details.comments);
       setTaskRuns(details.runs);

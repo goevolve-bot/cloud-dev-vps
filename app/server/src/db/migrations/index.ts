@@ -1,5 +1,6 @@
 import * as m0001Init from "./0001_init.js";
 import * as m0002ProviderCreds from "./0002_provider_creds.js";
+import * as m0003ProviderCredSecret from "./0003_provider_cred_secret.js";
 
 export interface Migration {
   readonly version: number;
@@ -8,7 +9,7 @@ export interface Migration {
   readonly down: string;
 }
 
-const modules = [m0001Init, m0002ProviderCreds];
+const modules = [m0001Init, m0002ProviderCreds, m0003ProviderCredSecret];
 
 export const migrations: Migration[] = modules
   .map((m) => ({ version: m.version, name: m.name, up: m.up, down: m.down }))

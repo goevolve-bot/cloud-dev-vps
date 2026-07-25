@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { fetchMtdCost, type Project } from "../api";
 import type { Theme } from "../hooks/useTheme";
+import { AddProjectModal } from "./AddProjectModal";
 import { SettingsModal } from "./SettingsModal";
 
 export const TABS = [
@@ -21,6 +22,10 @@ export interface HeaderProps {
   readonly onProjectsRefresh?: () => void;
 }
 
+// Sentinel option value — not a legal project name (uppercase, and no project
+// name may contain a space), so it can never collide with a real one.
+const ADD_PROJECT = "+ add project…";
+
 const LIFECYCLE_COLORS: Record<string, string> = {
   active: "var(--green, #22c55e)",
   idle: "var(--yellow, #eab308)",
@@ -38,6 +43,7 @@ export function Header({
   const navigate = useNavigate();
   const current = projects.find((p) => p.name === currentProject);
   const [showSettings, setShowSettings] = useState(false);
+  const [showAddProject, setShowAddProject] = useState(false);
   const [mtdCost, setMtdCost] = useState<number | null>(null);
 
   // Fetch MTD cost (T37)
@@ -62,14 +68,24 @@ export function Header({
         <select
           className="project-select"
           value={currentProject}
-          onChange={(event) => navigate(`/${event.target.value}/${activeTab}`)}
+          onChange={(event) => {
+            if (event.target.value === ADD_PROJECT) {
+              // `value` is controlled by currentProject, so the select snaps
+              // back to the current project on the next render by itself.
+              setShowAddProject(true);
+              return;
+            }
+            navigate(`/${event.target.value}/${activeTab}`);
+          }}
           aria-label="project"
         >
+          {projects.length === 0 && <option value="">no projects</option>}
           {projects.map((project) => (
             <option key={project.name} value={project.name}>
               {project.name}
             </option>
           ))}
+          <option value={ADD_PROJECT}>{ADD_PROJECT}</option>
         </select>
         <nav className="tabs">
           {TABS.map((tab) => (
@@ -130,6 +146,17 @@ export function Header({
           ⏻
         </button>
       </header>
+
+      {showAddProject && (
+        <AddProjectModal
+          onClose={() => setShowAddProject(false)}
+          onCreated={(project) => {
+            setShowAddProject(false);
+            onProjectsRefresh?.();
+            navigate(`/${project.name}/${activeTab}`);
+          }}
+        />
+      )}
 
       {showSettings && (
         <SettingsModal

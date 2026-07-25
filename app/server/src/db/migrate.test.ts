@@ -2,11 +2,17 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { openDb } from "./connection.js";
 import { migrateDown, migrateUp, migrationStatus } from "./migrate.js";
+import { migrations } from "./migrations/index.js";
+
+// Derived from the migration list rather than hard-coded, so adding one is not
+// automatically a test failure.
+const ALL_UP = migrations.map((m) => m.version);
+const ALL_DOWN = [...ALL_UP].reverse();
 
 test("migrateUp creates the schema and migrateDown reverts it", () => {
   const db = openDb(":memory:");
   try {
-    assert.deepEqual(migrateUp(db), [1, 2]);
+    assert.deepEqual(migrateUp(db), ALL_UP);
     assert.ok(migrationStatus(db).every((m) => m.applied));
 
     const insert = db.prepare(
@@ -24,7 +30,7 @@ test("migrateUp creates the schema and migrateDown reverts it", () => {
     };
     assert.equal(project.name, "demo");
 
-    assert.deepEqual(migrateDown(db, { to: 0 }), [2, 1]);
+    assert.deepEqual(migrateDown(db, { to: 0 }), ALL_DOWN);
     assert.throws(() => db.prepare("SELECT * FROM projects").all());
   } finally {
     db.close();
@@ -45,7 +51,7 @@ test("migrateDown(to) reverts everything above a version", () => {
   const db = openDb(":memory:");
   try {
     migrateUp(db);
-    assert.deepEqual(migrateDown(db, { to: 0 }), [2, 1]);
+    assert.deepEqual(migrateDown(db, { to: 0 }), ALL_DOWN);
     assert.ok(migrationStatus(db).every((m) => !m.applied));
   } finally {
     db.close();

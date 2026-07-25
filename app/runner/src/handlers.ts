@@ -31,6 +31,36 @@ export class NotImplementedError extends Error {
   readonly code = "not_implemented";
 }
 
+/** Where ~/.pm-creds is mounted, read-only, inside the agent container. */
+const CREDS_MOUNT = "/pm-creds";
+
+/**
+ * Credential file (written by pm-projectctl set-credential) → the environment
+ * variable the agent CLI reads. The file names come from
+ * PROVIDER_CREDENTIAL_KEYS in server/src/app.ts; adding a provider means
+ * adding it in both places.
+ *
+ * TODO: ANTIGRAVITY_API_KEY is unverified — nobody has run `agy --help` on a
+ * host yet (see docs/pm-remediation/README.md).
+ */
+const CREDENTIAL_ENV: Record<string, string> = {
+  anthropic: "ANTHROPIC_API_KEY",
+  antigravity: "ANTIGRAVITY_API_KEY",
+};
+
+/**
+ * A `sh -c` preamble that loads the mounted credentials into the environment
+ * and then `exec`s the real command. The value is read inside the container,
+ * so it never appears in any argv the host can see.
+ */
+function credentialShim(): string {
+  const lines = Object.entries(CREDENTIAL_ENV).map(
+    ([file, env]) =>
+      `if [ -r ${CREDS_MOUNT}/${file} ]; then ${env}="$(cat ${CREDS_MOUNT}/${file})"; export ${env}; fi`,
+  );
+  return [...lines, 'exec "$@"'].join("\n");
+}
+
 // Log management
 class RunLogManager {
   private readonly emitters = new Map<number, EventEmitter>();
@@ -609,23 +639,20 @@ export const handlers: { [V in RunnerVerb]: Handler<V> } = {
       `${os.homedir()}/.ssh:/root/.ssh:ro`,
     ];
 
-    // Read credentials
+    // Credentials reach the agent as a read-only mount, never on argv:
+    // process arguments are world-readable in /proc, so `-e KEY=value` would
+    // hand every user on the host the provider token for the length of a run.
     const credsDir = join(os.homedir(), ".pm-creds");
-    try {
-      const files = await readdir(credsDir);
-      for (const file of files) {
-        const content = (await readFile(join(credsDir, file), "utf8")).trim();
-        if (file === "claude" || file === "anthropic" || file === "oauth") {
-          dockerArgs.push("-e", `ANTHROPIC_API_KEY=${content}`);
-        }
-        dockerArgs.push("-e", `${file.toUpperCase()}_API_KEY=${content}`);
-        dockerArgs.push("-e", `${file.toUpperCase()}_TOKEN=${content}`);
-      }
-    } catch {
-      // ignore
+    if (existsSync(credsDir)) {
+      dockerArgs.push("-v", `${credsDir}:${CREDS_MOUNT}:ro`);
     }
 
     dockerArgs.push("pm-agent");
+    // The shim reads each mounted file inside the container and exports it
+    // under the name that CLI actually looks for — an explicit mapping, not
+    // the old fan-out that guessed at <FILE>_API_KEY and <FILE>_TOKEN. It is
+    // harmless without the mount: each export is guarded by a readability test.
+    dockerArgs.push("/bin/sh", "-c", credentialShim(), "pm-agent");
     dockerArgs.push(...cmd);
 
     // Spawn container

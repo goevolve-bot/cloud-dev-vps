@@ -1,63 +1,18 @@
 import { EventEmitter } from "node:events";
 import { appendFile, mkdir, readdir, copyFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { createConnection } from "node:net";
 import type Database from "better-sqlite3";
 import { addRunOutcome, getAdapter, pmDirFor, findTask, writeTaskDescription, moveTaskStatus } from "@pm/core";
 import { reindexTask } from "./indexer/index.js";
 import type { RunnerRegistry } from "./runners/registry.js";
 import { composePrompt, parseInterviewQuestions } from "./prompts.js";
+import { callProjectctl } from "./projectctl.js";
 
 export const sseEmitter = new EventEmitter();
 
-interface ProjectctlResult {
-  readonly ok: boolean;
-  readonly code?: string;
-  readonly message?: string;
-  readonly data?: any;
-}
-
-export function callProjectctl(
-  verb: string,
-  args: Record<string, any>,
-): Promise<ProjectctlResult> {
-  return new Promise((resolve) => {
-    const socket = createConnection("/srv/pm/projectctl.sock");
-    socket.setEncoding("utf8");
-
-    let buffer = "";
-    socket.on("connect", () => {
-      socket.write(`${JSON.stringify({ verb, args })}\n`);
-    });
-
-    socket.on("data", (chunk) => {
-      buffer += chunk;
-      let newlineAt = buffer.indexOf("\n");
-      while (newlineAt !== -1) {
-        const line = buffer.slice(0, newlineAt);
-        buffer = buffer.slice(newlineAt + 1);
-        newlineAt = buffer.indexOf("\n");
-        if (!line.trim()) continue;
-        try {
-          const msg = JSON.parse(line);
-          if (msg.type === "result" || msg.type === "error") {
-            socket.end();
-            resolve(msg);
-            return;
-          }
-        } catch (err) {
-          socket.end();
-          resolve({ ok: false, code: "parse_error", message: String(err) });
-          return;
-        }
-      }
-    });
-
-    socket.on("error", (err) => {
-      resolve({ ok: false, code: "connection_error", message: err.message });
-    });
-  });
-}
+// Historical import site — the client itself lives in projectctl.ts now that
+// app.ts drives `create` through it too.
+export { callProjectctl } from "./projectctl.js";
 
 export const activeRunnerRunIds = new Map<number, number>();
 

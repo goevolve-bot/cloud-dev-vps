@@ -68,6 +68,67 @@ export async function fetchProjects(): Promise<Project[]> {
   return body.projects;
 }
 
+export type CreateProjectEvent =
+  | { readonly type: "progress"; readonly step: string; readonly message: string }
+  | { readonly type: "awaiting-key"; readonly publicKey: string; readonly message: string }
+  | { readonly type: "ready"; readonly project: Project; readonly warnings?: string[] }
+  | { readonly type: "error"; readonly code: string; readonly message?: string };
+
+/**
+ * Creates a project, calling `onEvent` for each server-sent event until the
+ * stream closes. Resolves with the terminal event — `awaiting-key` is one of
+ * them, and is a success: POST the same input again once the deploy key has
+ * been added to the repository and `create` resumes from the clone.
+ */
+export async function createProject(
+  input: { name: string; gitUrl: string },
+  onEvent: (event: CreateProjectEvent) => void,
+): Promise<CreateProjectEvent> {
+  const response = await fetch("/api/projects", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok || !response.body) {
+    const detail = (await response.json().catch(() => null)) as { error?: string } | null;
+    throw new Error(detail?.error ?? `create project responded ${response.status}`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let last: CreateProjectEvent | null = null;
+
+  const consume = (chunk: string) => {
+    buffer += chunk;
+    let newlineAt = buffer.indexOf("\n\n");
+    while (newlineAt !== -1) {
+      const frame = buffer.slice(0, newlineAt);
+      buffer = buffer.slice(newlineAt + 2);
+      newlineAt = buffer.indexOf("\n\n");
+      const payload = frame
+        .split("\n")
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trim())
+        .join("");
+      if (!payload) continue;
+      const event = JSON.parse(payload) as CreateProjectEvent;
+      last = event;
+      onEvent(event);
+    }
+  };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    consume(decoder.decode(value, { stream: true }));
+  }
+  consume(decoder.decode());
+
+  if (!last) throw new Error("create project stream ended without a result");
+  return last;
+}
+
 export async function fetchTasks(project: string): Promise<Task[]> {
   const body = await getJson<{ tasks: Task[] }>(`/api/projects/${project}/tasks`);
   return body.tasks;
@@ -247,9 +308,14 @@ export async function stopRun(runId: number): Promise<boolean> {
   return body.stopped;
 }
 
-export async function answerQuestion(questionId: number, answer: string): Promise<Question> {
+export async function answerQuestion(
+  project: string,
+  taskId: number,
+  questionId: number,
+  answer: string,
+): Promise<Question> {
   const body = await sendJson<{ question: Question }>(
-    `/api/questions/${questionId}/answer`,
+    `/api/projects/${project}/tasks/${taskId}/questions/${questionId}/answer`,
     "POST",
     { answer },
   );
@@ -319,11 +385,32 @@ export async function fetchProviders(): Promise<ProviderInfo[]> {
   return body.providers;
 }
 
+export interface ConnectProviderResult {
+  readonly ok: boolean;
+  readonly maskedKey?: string;
+  /** How many project users received the key. Zero is fine — see the route. */
+  readonly projectsUpdated?: number;
+  readonly message?: string;
+  readonly failures?: { project: string; message?: string }[];
+}
+
+/**
+ * Unlike the other writers this reads the body on failure too: the server
+ * answers 502 when the key reached some project users but not others, and
+ * which ones failed is the only useful part of that answer.
+ */
 export async function connectProvider(
   provider: string,
   input: { type: "api-key"; key: string },
-): Promise<{ ok: boolean; maskedKey: string }> {
-  return sendJson(`/api/providers/${provider}/connect`, "POST", input);
+): Promise<ConnectProviderResult> {
+  const response = await fetch(`/api/providers/${provider}/connect`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  const body = (await response.json().catch(() => null)) as ConnectProviderResult | null;
+  if (!body) throw new Error(`connect provider responded ${response.status}`);
+  return body;
 }
 
 export async function updateProjectDefaults(

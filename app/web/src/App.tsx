@@ -29,8 +29,25 @@ function ProjectShell({ tab }: ProjectShellProps) {
   if (!projects) {
     return <div className="empty-state">Loading…</div>;
   }
+  // Still render the header: its project menu is the only way to create the
+  // first project, and returning a bare empty state here left a fresh deploy
+  // with nothing to click.
   if (projects.length === 0) {
-    return <div className="empty-state">No projects yet.</div>;
+    return (
+      <div className="shell">
+        <Header
+          projects={projects}
+          currentProject=""
+          activeTab={tab}
+          theme={theme}
+          onToggleTheme={toggleTheme}
+          onProjectsRefresh={refresh}
+        />
+        <div className="empty-state">
+          No projects yet — pick “+ add project…” in the project menu to create one.
+        </div>
+      </div>
+    );
   }
 
   const current = projects.some((p) => p.name === project) ? project : projects[0].name;

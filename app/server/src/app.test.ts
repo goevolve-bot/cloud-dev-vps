@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, mkdir, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -14,6 +15,118 @@ interface Fixture {
   readonly app: FastifyInstance;
   readonly repoDir: string;
   readonly db: Database.Database;
+}
+
+// ─── pm-projectctl stub ──────────────────────────────────────────────────────
+// A real unix socket speaking the NDJSON protocol from app/scripts/pm-projectctl,
+// so these tests exercise the actual client (progress framing, terminal event
+// shapes, argument names) rather than a mocked-out call.
+
+type StubArgs = Record<string, string | undefined>;
+
+interface StubCall {
+  readonly verb: string;
+  readonly args: StubArgs;
+}
+
+type StubReply =
+  | { readonly ok: true; readonly data?: unknown }
+  | { readonly ok: false; readonly code: string; readonly message: string };
+
+type StubResponder = (
+  verb: string,
+  args: StubArgs,
+  emit: (step: string, message: string) => void,
+  callIndex: number,
+) => StubReply;
+
+interface ProjectctlStub {
+  readonly calls: StubCall[];
+  close(): Promise<void>;
+}
+
+async function startProjectctlStub(respond: StubResponder): Promise<ProjectctlStub> {
+  const dir = await mkdtemp(join(tmpdir(), "pm-pctl-"));
+  const socketPath = join(dir, "projectctl.sock");
+  const calls: StubCall[] = [];
+
+  const server = createServer((socket) => {
+    let buffer = "";
+    socket.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      const newlineAt = buffer.indexOf("\n");
+      if (newlineAt === -1) return;
+      const request = JSON.parse(buffer.slice(0, newlineAt));
+      buffer = "";
+      const callIndex = calls.length;
+      calls.push({ verb: request.verb, args: request.args });
+
+      const write = (event: unknown) => socket.write(`${JSON.stringify(event)}\n`);
+      const emit = (step: string, message: string) =>
+        write({ type: "progress", step, message });
+      const reply = respond(request.verb, request.args, emit, callIndex);
+      if (reply.ok) write({ type: "result", ok: true, data: reply.data ?? {} });
+      else write({ type: "error", code: reply.code, message: reply.message });
+      socket.end();
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+  process.env.PM_PROJECTCTL_SOCK = socketPath;
+
+  return {
+    calls,
+    close: async () => {
+      delete process.env.PM_PROJECTCTL_SOCK;
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+interface ProjectRow {
+  readonly git_url: string;
+  readonly repo_dir: string | null;
+  readonly runner_socket: string | null;
+  readonly lifecycle: string;
+}
+
+interface ProviderView {
+  readonly id: string;
+  readonly authType: string;
+  readonly connected: boolean;
+}
+
+/** The union of every field POST /api/projects puts on an SSE frame. */
+interface SseEvent {
+  readonly type: string;
+  readonly step?: string;
+  readonly message?: string;
+  readonly code?: string;
+  readonly publicKey?: string;
+  readonly project?: { name: string; gitUrl: string; repoDir: string | null };
+  readonly warnings?: string[];
+}
+
+/** The stream's last frame — `ready`, `awaiting-key` or `error`. */
+function terminalEvent(payload: string): SseEvent {
+  const last = sseEvents(payload).at(-1);
+  assert.ok(last, "the SSE stream ended without an event");
+  return last;
+}
+
+/** Parses an SSE body into the JSON payload of each `data:` frame. */
+function sseEvents(payload: string): SseEvent[] {
+  return payload
+    .split("\n\n")
+    .map((frame) =>
+      frame
+        .split("\n")
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trim())
+        .join(""),
+    )
+    .filter(Boolean)
+    .map((data) => JSON.parse(data));
 }
 
 async function withApp(fn: (fx: Fixture) => Promise<void>): Promise<void> {
@@ -304,6 +417,310 @@ test("runs queue endpoints create, list, and stop queued runs", () =>
     assert.equal(listResAfter.json().runs[0].status, "cancelled");
   }));
 
+test("POST /api/projects streams progress, inserts the row and indexes the tree", () =>
+  withApp(async ({ app, db }) => {
+    const newRepo = await mkdtemp(join(tmpdir(), "pm-newproj-"));
+    const stub = await startProjectctlStub((verb, args, emit) => {
+      assert.equal(verb, "create");
+      emit("user", `creating user pm-${args.name}`);
+      emit("clone", "cloning");
+      return {
+        ok: true,
+        data: {
+          status: "ready",
+          name: args.name,
+          user: `pm-${args.name}`,
+          gitUrl: args.gitUrl,
+          repoDir: newRepo,
+          publicKey: "ssh-ed25519 AAAA...",
+          runnerSocket: `/srv/pm/runners/${args.name}/control.sock`,
+          warnings: [],
+        },
+      };
+    });
+
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/projects",
+        payload: { name: "shop", gitUrl: "git@example.com:you/shop.git" },
+      });
+      assert.equal(response.statusCode, 200);
+      assert.match(response.headers["content-type"] as string, /text\/event-stream/);
+
+      const events = sseEvents(response.payload);
+      assert.deepEqual(
+        events.filter((e) => e.type === "progress").map((e) => e.step),
+        ["user", "clone", "credentials", "index"],
+      );
+      const terminal = terminalEvent(response.payload);
+      assert.equal(terminal.type, "ready");
+      assert.equal(terminal.project?.name, "shop");
+      assert.equal(terminal.project?.gitUrl, "git@example.com:you/shop.git");
+      assert.equal(terminal.project?.repoDir, newRepo);
+
+      const row = db.prepare("SELECT * FROM projects WHERE name = 'shop'").get() as ProjectRow;
+      assert.equal(row.git_url, "git@example.com:you/shop.git");
+      assert.equal(row.runner_socket, "/srv/pm/runners/shop/control.sock");
+      assert.equal(row.lifecycle, "active");
+
+      const list = await app.inject({ method: "GET", url: "/api/projects" });
+      assert.deepEqual(
+        list.json().projects.map((p: { name: string }) => p.name),
+        ["demo", "shop"],
+      );
+    } finally {
+      await stub.close();
+      await rm(newRepo, { recursive: true, force: true });
+    }
+  }));
+
+test("POST /api/projects surfaces awaiting-key and resumes on a second POST", () =>
+  withApp(async ({ app, db }) => {
+    const newRepo = await mkdtemp(join(tmpdir(), "pm-newproj-"));
+    const stub = await startProjectctlStub((verb, args, emit, callIndex) => {
+      emit("key", "generating deploy key");
+      if (callIndex === 0) {
+        return {
+          ok: true,
+          data: {
+            status: "awaiting-key",
+            name: args.name,
+            publicKey: "ssh-ed25519 AAAAdeploy",
+            message: "Add the deploy key to the repository (write access).",
+          },
+        };
+      }
+      return {
+        ok: true,
+        data: { status: "ready", name: args.name, repoDir: newRepo, warnings: [] },
+      };
+    });
+
+    try {
+      const payload = { name: "shop", gitUrl: "git@example.com:you/shop.git" };
+
+      const first = await app.inject({ method: "POST", url: "/api/projects", payload });
+      assert.equal(first.statusCode, 200);
+      const firstTerminal = terminalEvent(first.payload);
+      assert.equal(firstTerminal.type, "awaiting-key");
+      assert.equal(firstTerminal.publicKey, "ssh-ed25519 AAAAdeploy");
+      // Nothing is inserted while the key is still unauthorized.
+      assert.equal(db.prepare("SELECT * FROM projects WHERE name = 'shop'").get(), undefined);
+
+      const second = await app.inject({ method: "POST", url: "/api/projects", payload });
+      assert.equal(second.statusCode, 200);
+      assert.equal(terminalEvent(second.payload).type, "ready");
+      assert.ok(db.prepare("SELECT * FROM projects WHERE name = 'shop'").get());
+
+      // Resuming must not be rejected as "already exists"…
+      const third = await app.inject({ method: "POST", url: "/api/projects", payload });
+      assert.equal(third.statusCode, 200);
+      assert.equal(terminalEvent(third.payload).type, "ready");
+      assert.equal(stub.calls.length, 3);
+    } finally {
+      await stub.close();
+      await rm(newRepo, { recursive: true, force: true });
+    }
+  }));
+
+test("POST /api/projects rejects a bad name and a name already bound to another URL", () =>
+  withApp(async ({ app }) => {
+    const bad = await app.inject({
+      method: "POST",
+      url: "/api/projects",
+      payload: { name: "Not_A_Name", gitUrl: "git@example.com:you/x.git" },
+    });
+    assert.equal(bad.statusCode, 400);
+    assert.equal(bad.json().error, "invalid_name");
+
+    const conflict = await app.inject({
+      method: "POST",
+      url: "/api/projects",
+      payload: { name: "demo", gitUrl: "git@example.com:someone/else.git" },
+    });
+    assert.equal(conflict.statusCode, 409);
+    assert.equal(conflict.json().error, "project_exists");
+  }));
+
+test("POST /api/projects reports a projectctl failure as an error event", () =>
+  withApp(async ({ app, db }) => {
+    const stub = await startProjectctlStub(() => ({
+      ok: false,
+      code: "invalid_url",
+      message: "git URL must be https://, ssh:// or user@host:path",
+    }));
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/projects",
+        payload: { name: "shop", gitUrl: "ext::sh -c evil" },
+      });
+      const terminal = terminalEvent(response.payload);
+      assert.equal(terminal.type, "error");
+      assert.equal(terminal.code, "invalid_url");
+      assert.equal(db.prepare("SELECT * FROM projects WHERE name = 'shop'").get(), undefined);
+    } finally {
+      await stub.close();
+    }
+  }));
+
+test("connecting a provider fans the key out to every project user", () =>
+  withApp(async ({ app, db }) => {
+    const stub = await startProjectctlStub(() => ({ ok: true, data: { written: true } }));
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/providers/claude/connect",
+        payload: { type: "api-key", key: "sk-ant-secret-value" },
+      });
+      assert.equal(response.statusCode, 200);
+      assert.equal(response.json().ok, true);
+      assert.equal(response.json().projectsUpdated, 1);
+
+      // The exact argument names verb_set_credential validates: `key` (not
+      // `credential`), a real project name (not `_pm`), lowercase key name.
+      assert.equal(stub.calls.length, 1);
+      assert.deepEqual(stub.calls[0], {
+        verb: "set-credential",
+        args: { name: "demo", key: "anthropic", value: "sk-ant-secret-value" },
+      });
+
+      const cred = db
+        .prepare("SELECT * FROM provider_creds WHERE provider = 'claude'")
+        .get() as { secret: string; masked_key: string };
+      assert.equal(cred.secret, "sk-ant-secret-value");
+      assert.match(cred.masked_key, /^sk-a\*+alue$/);
+
+      const providers = (await app.inject({ method: "GET", url: "/api/providers" })).json()
+        .providers;
+      assert.equal(providers.find((p: ProviderView) => p.id === "claude")?.connected, true);
+      // No OAuth flow exists, so no provider may claim one.
+      assert.deepEqual(
+        providers.map((p: ProviderView) => p.authType),
+        ["api-key", "api-key"],
+      );
+    } finally {
+      await stub.close();
+    }
+  }));
+
+test("a failed set-credential is reported instead of being recorded as connected", () =>
+  withApp(async ({ app, db }) => {
+    const stub = await startProjectctlStub(() => ({
+      ok: false,
+      code: "unknown_project",
+      message: "project 'demo' does not exist",
+    }));
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/providers/claude/connect",
+        payload: { type: "api-key", key: "sk-ant-secret-value" },
+      });
+      assert.equal(response.statusCode, 502);
+      const body = response.json();
+      assert.equal(body.ok, false);
+      assert.equal(body.failures[0].project, "demo");
+      assert.match(body.failures[0].message, /does not exist/);
+
+      // The old code wrote the masked row regardless and the UI said
+      // "Connected" while ~/.pm-creds stayed empty.
+      assert.equal(db.prepare("SELECT * FROM provider_creds").get(), undefined);
+      const providers = (await app.inject({ method: "GET", url: "/api/providers" })).json()
+        .providers;
+      assert.equal(providers.find((p: ProviderView) => p.id === "claude")?.connected, false);
+    } finally {
+      await stub.close();
+    }
+  }));
+
+test("a project created after the key was entered is seeded with it", () =>
+  withApp(async ({ app, db }) => {
+    const newRepo = await mkdtemp(join(tmpdir(), "pm-newproj-"));
+    const stub = await startProjectctlStub((verb, args) => {
+      if (verb === "create") {
+        return { ok: true, data: { status: "ready", name: args.name, repoDir: newRepo } };
+      }
+      return { ok: true, data: { written: true } };
+    });
+    try {
+      await app.inject({
+        method: "POST",
+        url: "/api/providers/claude/connect",
+        payload: { type: "api-key", key: "sk-ant-secret-value" },
+      });
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/projects",
+        payload: { name: "shop", gitUrl: "git@example.com:you/shop.git" },
+      });
+      assert.equal(terminalEvent(response.payload).type, "ready");
+
+      const seeded = stub.calls.filter(
+        (call) => call.verb === "set-credential" && call.args.name === "shop",
+      );
+      assert.deepEqual(seeded.map((call) => call.args.key), ["anthropic"]);
+      assert.equal(seeded[0].args.value, "sk-ant-secret-value");
+      assert.ok(db.prepare("SELECT * FROM projects WHERE name = 'shop'").get());
+    } finally {
+      await stub.close();
+      await rm(newRepo, { recursive: true, force: true });
+    }
+  }));
+
+test("connect rejects an unknown provider and a non-key auth type", () =>
+  withApp(async ({ app }) => {
+    const unknown = await app.inject({
+      method: "POST",
+      url: "/api/providers/gpt/connect",
+      payload: { type: "api-key", key: "x" },
+    });
+    assert.equal(unknown.statusCode, 404);
+
+    const wrongType = await app.inject({
+      method: "POST",
+      url: "/api/providers/claude/connect",
+      payload: { type: "oauth" },
+    });
+    assert.equal(wrongType.statusCode, 400);
+  }));
+
+test("answering a question requires the right project and task", () =>
+  withApp(async ({ app, db }) => {
+    const created = await createTaskViaApi(app, { title: "Auth", description: "d" });
+    const taskNum = created.task.id;
+    db.prepare(
+      "INSERT INTO runs (id, project_id, task_num, phase, provider, model, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(202, 1, taskNum, "interview", "claude", "claude-3-5", "succeeded", "2026-01-01T00:00:00Z");
+    const questionId = db
+      .prepare("INSERT INTO questions (project_id, task_num, run_id, text) VALUES (?, ?, ?, ?)")
+      .run(1, taskNum, 202, "Which auth?").lastInsertRowid;
+
+    const wrongProject = await app.inject({
+      method: "POST",
+      url: `/api/projects/ghost/tasks/${taskNum}/questions/${questionId}/answer`,
+      payload: { answer: "x" },
+    });
+    assert.equal(wrongProject.statusCode, 404);
+
+    const wrongTask = await app.inject({
+      method: "POST",
+      url: `/api/projects/demo/tasks/999/questions/${questionId}/answer`,
+      payload: { answer: "x" },
+    });
+    assert.equal(wrongTask.statusCode, 404);
+
+    const ok = await app.inject({
+      method: "POST",
+      url: `/api/projects/demo/tasks/${taskNum}/questions/${questionId}/answer`,
+      payload: { answer: "JWT" },
+    });
+    assert.equal(ok.statusCode, 200);
+    assert.equal(ok.json().question.answer, "JWT");
+  }));
+
 test("answering questions and retrieving specs/ADRs", () =>
   withApp(async ({ app, repoDir, db }) => {
     const created = await createTaskViaApi(app, { title: "Auth Task", description: "basic auth" });
@@ -322,7 +739,7 @@ test("answering questions and retrieving specs/ADRs", () =>
     // Answer the question
     const answerRes = await app.inject({
       method: "POST",
-      url: `/api/questions/${questionId}/answer`,
+      url: `/api/projects/demo/tasks/${taskNum}/questions/${questionId}/answer`,
       payload: { answer: "Yes, use JWT" },
     });
     assert.equal(answerRes.statusCode, 200);

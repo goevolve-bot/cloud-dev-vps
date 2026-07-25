@@ -20,6 +20,7 @@ export function SettingsModal({ currentProject, onClose, onProjectUpdated }: Set
   const [apiKey, setApiKey] = useState<Record<string, string>>({});
   const [connecting, setConnecting] = useState<Record<string, boolean>>({});
   const [connectMsg, setConnectMsg] = useState<Record<string, string>>({});
+  const [connectFailed, setConnectFailed] = useState<Record<string, boolean>>({});
   const [defProvider, setDefProvider] = useState(currentProject?.defaultProvider ?? "claude");
   const [defModel, setDefModel] = useState(
     currentProject?.defaultModel ?? "claude-3-5-sonnet-latest",
@@ -54,17 +55,35 @@ export function SettingsModal({ currentProject, onClose, onProjectUpdated }: Set
     if (!key.trim()) return;
     setConnecting((c) => ({ ...c, [providerId]: true }));
     setConnectMsg((m) => ({ ...m, [providerId]: "" }));
+    setConnectFailed((f) => ({ ...f, [providerId]: false }));
     try {
       const result = await connectProvider(providerId, { type: "api-key", key });
-      setConnectMsg((m) => ({
-        ...m,
-        [providerId]: result.ok ? `Connected (${result.maskedKey})` : "Failed",
-      }));
-      setApiKey((k) => ({ ...k, [providerId]: "" }));
+      if (result.ok) {
+        // Zero projects still counts: the key is stored and every project
+        // created from here on is seeded with it.
+        const scope =
+          result.projectsUpdated === 0
+            ? "no projects yet — it will be added to the first one you create"
+            : `written to ${result.projectsUpdated} project${result.projectsUpdated === 1 ? "" : "s"}`;
+        setConnectMsg((m) => ({ ...m, [providerId]: `Connected (${result.maskedKey}) — ${scope}` }));
+        setApiKey((k) => ({ ...k, [providerId]: "" }));
+      } else {
+        // The key did not reach every project, so the provider stays
+        // disconnected. Keep the field filled so a retry is one click.
+        const which = (result.failures ?? [])
+          .map((f) => `${f.project}: ${f.message ?? "failed"}`)
+          .join("; ");
+        setConnectMsg((m) => ({
+          ...m,
+          [providerId]: `Not connected — ${result.message ?? "delivery failed"}${which ? ` (${which})` : ""}`,
+        }));
+        setConnectFailed((f) => ({ ...f, [providerId]: true }));
+      }
       const updated = await fetchProviders();
       setProviders(updated);
     } catch (err) {
       setConnectMsg((m) => ({ ...m, [providerId]: String(err) }));
+      setConnectFailed((f) => ({ ...f, [providerId]: true }));
     } finally {
       setConnecting((c) => ({ ...c, [providerId]: false }));
     }
@@ -240,7 +259,13 @@ export function SettingsModal({ currentProject, onClose, onProjectUpdated }: Set
                 )}
 
                 {connectMsg[p.id] && (
-                  <div style={{ marginTop: 8, fontSize: 12, color: "var(--accent)" }}>
+                  <div
+                    style={{
+                      marginTop: 8,
+                      fontSize: 12,
+                      color: connectFailed[p.id] ? "var(--red, #ef4444)" : "var(--accent)",
+                    }}
+                  >
                     {connectMsg[p.id]}
                   </div>
                 )}

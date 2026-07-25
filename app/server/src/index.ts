@@ -1,4 +1,4 @@
-import { buildApp } from "./app.js";
+import { buildApp, reconcileDiscoveredProjects } from "./app.js";
 import { openDb } from "./db/connection.js";
 import { migrateUp } from "./db/migrate.js";
 import { RunnerRegistry } from "./runners/registry.js";
@@ -15,6 +15,15 @@ migrateUp(db);
 
 const runners = new RunnerRegistry({ runnersDir });
 await runners.start();
+
+// Best effort: a projectctl socket that is not there yet must not stop the
+// API from coming up.
+try {
+  const adopted = await reconcileDiscoveredProjects({ db, runners });
+  if (adopted.length > 0) console.log(`adopted out-of-band projects: ${adopted.join(", ")}`);
+} catch (err) {
+  console.warn("reconciling discovered projects failed:", err);
+}
 
 const app = buildApp({ db, runners });
 

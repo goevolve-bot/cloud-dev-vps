@@ -21,9 +21,10 @@ import {
   listAdrs,
   type TaskStatus,
 } from "@pm/core";
-import { reindexTask } from "./indexer/index.js";
+import { rebuildIndex, reindexTask } from "./indexer/index.js";
 import type { RunnerRegistry } from "./runners/registry.js";
 import { QueueManager, sseEmitter, activeRunnerRunIds } from "./queue.js";
+import { callProjectctl } from "./projectctl.js";
 
 export interface AppContext {
   readonly db: Database.Database;
@@ -115,6 +116,31 @@ function extFor(mimeType: string): string {
   return found?.[0] ?? "bin";
 }
 
+// Mirrors pm-projectctl's NAME_RE. Checking here too means a bad name is a
+// 400 with a useful message rather than an `invalid_name` error arriving
+// halfway through an SSE stream.
+const PROJECT_NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,27}[a-z0-9])?$/;
+
+/**
+ * Provider id → the file name written into each project user's ~/.pm-creds/.
+ *
+ * Constrained on both ends: pm-projectctl's CREDENTIAL_KEY_RE demands
+ * `^[a-z][a-z0-9_-]{0,63}$` (which is why this is not the env var name), and
+ * the runner maps these exact file names onto environment variables inside
+ * the agent container — see CREDENTIAL_ENV in runner/src/handlers.ts. Adding a
+ * provider means adding it in both places.
+ */
+const PROVIDER_CREDENTIAL_KEYS: Record<string, string> = {
+  claude: "anthropic",
+  antigravity: "antigravity",
+};
+
+function maskKey(key: string): string {
+  return key.length > 8
+    ? `${key.slice(0, 4)}${"*".repeat(key.length - 8)}${key.slice(-4)}`
+    : "****";
+}
+
 // A single path segment, no separators — closes off traversal outside the
 // task's attachments/ directory regardless of what @pm/core does with it.
 const SAFE_FILENAME_RE = /^[^/\\]+$/;
@@ -132,6 +158,55 @@ function isSafeFilename(name: string): boolean {
 function resolveWebRoot(): string {
   if (process.env.PM_WEB_DIR) return process.env.PM_WEB_DIR;
   return resolve(dirname(fileURLToPath(import.meta.url)), "../../web/dist");
+}
+
+/**
+ * Adopt projects that exist on the host but not in pm's DB.
+ *
+ * POST /api/projects is the authoritative path and inserts its own row; this
+ * only catches projects provisioned out of band — `pm-projectctl create` run
+ * over SSH, or a DB restored from before B2. Discovery gives us a name;
+ * `status` gives us the git URL and repo dir that the row actually needs, and
+ * a project it cannot answer for is skipped rather than half-inserted.
+ */
+export async function reconcileDiscoveredProjects(ctx: AppContext): Promise<string[]> {
+  const { db, runners } = ctx;
+  const adopted: string[] = [];
+
+  for (const name of runners.projects()) {
+    const known = db.prepare("SELECT id FROM projects WHERE name = ?").get(name);
+    if (known) continue;
+
+    const result = await callProjectctl("status", { name });
+    const entries = (result.data?.projects ?? []) as {
+      gitUrl?: string;
+      repoDir?: string;
+      runnerSocket?: string;
+    }[];
+    const entry = entries[0];
+    if (!result.ok || !entry?.gitUrl) {
+      console.warn(`[reconcile] skipping ${name}: ${result.message ?? "no status from projectctl"}`);
+      continue;
+    }
+
+    const now = new Date().toISOString();
+    const insert = db
+      .prepare(
+        "INSERT INTO projects (name, git_url, repo_dir, runner_socket, lifecycle, created_at, updated_at) VALUES (?, ?, ?, ?, 'active', ?, ?)",
+      )
+      .run(name, entry.gitUrl, entry.repoDir ?? null, entry.runnerSocket ?? null, now, now);
+
+    if (entry.repoDir) {
+      try {
+        await rebuildIndex(db, { id: Number(insert.lastInsertRowid), repoDir: entry.repoDir });
+      } catch (err) {
+        console.warn(`[reconcile] indexing ${name} failed:`, err);
+      }
+    }
+    adopted.push(name);
+  }
+
+  return adopted;
 }
 
 export function buildApp(ctx: AppContext): FastifyInstance {
@@ -175,11 +250,182 @@ export function buildApp(ctx: AppContext): FastifyInstance {
     }
   }
 
+  interface CredentialSeed {
+    readonly provider: string;
+    readonly key: string;
+    readonly value: string;
+  }
+
+  /** Every provider key pm currently holds, in ~/.pm-creds file-name form. */
+  function storedCredentials(): CredentialSeed[] {
+    const rows = db
+      .prepare("SELECT provider, secret FROM provider_creds WHERE secret IS NOT NULL")
+      .all() as { provider: string; secret: string }[];
+    return rows
+      .map((row) => ({
+        provider: row.provider,
+        key: PROVIDER_CREDENTIAL_KEYS[row.provider] ?? "",
+        value: row.secret,
+      }))
+      .filter((seed) => seed.key !== "");
+  }
+
+  interface DeliveryResult {
+    readonly project: string;
+    readonly key: string;
+    readonly ok: boolean;
+    readonly message?: string;
+  }
+
+  async function deliverCredential(
+    projectName: string,
+    seed: CredentialSeed,
+  ): Promise<DeliveryResult> {
+    const result = await callProjectctl("set-credential", {
+      name: projectName,
+      key: seed.key,
+      value: seed.value,
+    });
+    return {
+      project: projectName,
+      key: seed.key,
+      ok: Boolean(result.ok),
+      message: result.ok ? undefined : (result.message ?? result.code ?? "unknown error"),
+    };
+  }
+
+  /** Re-seed a freshly created project with the keys entered before it existed. */
+  async function seedCredentialsInto(projectName: string): Promise<DeliveryResult[]> {
+    const results: DeliveryResult[] = [];
+    for (const seed of storedCredentials()) {
+      results.push(await deliverCredential(projectName, seed));
+    }
+    return results;
+  }
+
   app.get("/health", async () => ({ status: "ok" }));
 
   app.get("/api/projects", async () => {
     const rows = db.prepare("SELECT * FROM projects ORDER BY name").all() as ProjectRow[];
     return { projects: rows.map((row) => serializeProject(row, runners.state(row.name))) };
+  });
+
+  /**
+   * Create a project, streaming progress as SSE.
+   *
+   * `create` provisions a user, rootless docker, a deploy key and a clone — it
+   * takes minutes, so a plain request/response would look hung. The stream
+   * carries `progress`, then exactly one of `awaiting-key`, `ready` or
+   * `error`, then closes.
+   *
+   * `awaiting-key` is a success, not a failure: the deploy key exists but the
+   * repo has not authorized it yet. The client shows the key and POSTs the
+   * same body again once the user has added it; `create` is idempotent and
+   * resumes from the clone step.
+   */
+  app.post("/api/projects", async (request, reply) => {
+    const body = request.body as { name?: string; gitUrl?: string } | undefined;
+    const name = typeof body?.name === "string" ? body.name.trim() : "";
+    const gitUrl = typeof body?.gitUrl === "string" ? body.gitUrl.trim() : "";
+
+    if (!PROJECT_NAME_RE.test(name)) {
+      return reply.code(400).send({
+        error: "invalid_name",
+        message:
+          "project name must be lowercase [a-z0-9-], start and end alphanumeric, max 29 characters",
+      });
+    }
+    if (!gitUrl) {
+      return reply.code(400).send({ error: "git_url_required" });
+    }
+
+    // A repeat POST for the same project is the documented resume path, so
+    // only a *different* URL for a name we already track is a conflict.
+    const existing = getProjectRow(name);
+    if (existing && existing.git_url !== gitUrl) {
+      return reply
+        .code(409)
+        .send({ error: "project_exists", message: `${name} already tracks ${existing.git_url}` });
+    }
+
+    reply.hijack();
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+    const send = (event: Record<string, unknown>) => {
+      reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
+    };
+
+    const result = await callProjectctl("create", { name, gitUrl }, (progress) =>
+      send({ type: "progress", step: progress.step, message: progress.message }),
+    );
+
+    if (!result.ok) {
+      send({ type: "error", code: result.code ?? "projectctl_failed", message: result.message });
+      reply.raw.end();
+      return;
+    }
+
+    const data = (result.data ?? {}) as {
+      status?: string;
+      publicKey?: string;
+      message?: string;
+      repoDir?: string;
+      runnerSocket?: string;
+      warnings?: string[];
+    };
+
+    if (data.status === "awaiting-key") {
+      send({
+        type: "awaiting-key",
+        publicKey: data.publicKey,
+        message: data.message,
+      });
+      reply.raw.end();
+      return;
+    }
+
+    const now = new Date().toISOString();
+    if (existing) {
+      db.prepare(
+        "UPDATE projects SET git_url = ?, repo_dir = ?, runner_socket = ?, lifecycle = 'active', updated_at = ? WHERE id = ?",
+      ).run(gitUrl, data.repoDir ?? null, data.runnerSocket ?? null, now, existing.id);
+    } else {
+      db.prepare(
+        "INSERT INTO projects (name, git_url, repo_dir, runner_socket, lifecycle, created_at, updated_at) VALUES (?, ?, ?, ?, 'active', ?, ?)",
+      ).run(name, gitUrl, data.repoDir ?? null, data.runnerSocket ?? null, now, now);
+    }
+    const row = getProjectRow(name)!;
+
+    const warnings = [...(data.warnings ?? [])];
+
+    // The key may have been entered before this project existed; §2.2's
+    // fan-out could not have reached it, so seed it now.
+    send({ type: "progress", step: "credentials", message: "seeding provider credentials" });
+    for (const delivery of await seedCredentialsInto(name)) {
+      if (!delivery.ok) {
+        warnings.push(`credential ${delivery.key} was not written: ${delivery.message}`);
+      }
+    }
+
+    if (row.repo_dir) {
+      send({ type: "progress", step: "index", message: "indexing .pm/ tree" });
+      try {
+        await rebuildIndex(db, { id: row.id, repoDir: row.repo_dir });
+      } catch (err) {
+        warnings.push(`indexing failed: ${String(err)}`);
+      }
+    }
+
+    send({
+      type: "ready",
+      project: serializeProject(getProjectRow(name)!, runners.state(name)),
+      publicKey: data.publicKey,
+      warnings,
+    });
+    reply.raw.end();
   });
 
   app.get("/api/projects/:name", async (request, reply) => {
@@ -234,21 +480,37 @@ export function buildApp(ctx: AppContext): FastifyInstance {
     return { task: serializeTask(task), comments, runs, queueRuns, questions, plan };
   });
 
-  app.post("/api/questions/:id/answer", async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const body = request.body as { answer: string };
-    if (typeof body.answer !== "string") {
-      return reply.code(400).send({ error: "answer_required" });
-    }
-    const result = db
-      .prepare("UPDATE questions SET answer = ?, answered_at = ? WHERE id = ?")
-      .run(body.answer, new Date().toISOString(), Number(id));
-    if (result.changes === 0) {
-      return reply.code(404).send({ error: "question_not_found" });
-    }
-    const question = db.prepare("SELECT * FROM questions WHERE id = ?").get(Number(id));
-    return { question };
-  });
+  // Scoped to its project and task like every neighbouring route: a question
+  // id alone must not be enough to answer it.
+  app.post(
+    "/api/projects/:name/tasks/:taskNum/questions/:id/answer",
+    async (request, reply) => {
+      const { name, taskNum, id } = request.params as {
+        name: string;
+        taskNum: string;
+        id: string;
+      };
+      const project = getProjectRow(name);
+      if (!project) return reply.code(404).send({ error: "project_not_found" });
+      const num = Number(taskNum);
+      if (!getTaskRow(project.id, num)) return reply.code(404).send({ error: "task_not_found" });
+
+      const body = request.body as { answer: string };
+      if (typeof body?.answer !== "string") {
+        return reply.code(400).send({ error: "answer_required" });
+      }
+      const result = db
+        .prepare(
+          "UPDATE questions SET answer = ?, answered_at = ? WHERE id = ? AND project_id = ? AND task_num = ?",
+        )
+        .run(body.answer, new Date().toISOString(), Number(id), project.id, num);
+      if (result.changes === 0) {
+        return reply.code(404).send({ error: "question_not_found" });
+      }
+      const question = db.prepare("SELECT * FROM questions WHERE id = ?").get(Number(id));
+      return { question };
+    },
+  );
 
   app.get("/api/projects/:name/specs", async (request, reply) => {
     const { name } = request.params as { name: string };
@@ -646,7 +908,6 @@ export function buildApp(ctx: AppContext): FastifyInstance {
     }
 
     if (body.action === "start" || body.action === "stop") {
-      const { callProjectctl } = await import("./queue.js");
       const result = await callProjectctl(body.action, { name });
       if (result.ok) {
         const lifecycle = body.action === "start" ? "active" : "stopped";
@@ -678,8 +939,13 @@ export function buildApp(ctx: AppContext): FastifyInstance {
       },
       {
         id: "antigravity",
+        // TODO: antigravity is an OAuth product and `agy auth login` is the
+        // native flow, but no OAuth handler exists anywhere in pm — advertising
+        // "oauth" here while the UI only offers a key field was a straight
+        // contradiction. Until that flow is built this is an API key like any
+        // other; revisit when there is something to redirect to.
         name: "Antigravity",
-        authType: "oauth" as const,
+        authType: "api-key" as const,
         models: [
           { id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5 (via AGY)" },
           { id: "claude-3-7-sonnet-latest", name: "Claude 3.7 Sonnet (via AGY)" },
@@ -710,36 +976,56 @@ export function buildApp(ctx: AppContext): FastifyInstance {
     };
   });
 
+  /**
+   * Store a provider key and push it into every project user's ~/.pm-creds/.
+   *
+   * There is no `_pm` project — credentials are per-project by design, so this
+   * fans out. The rule on partial failure is all-or-nothing *reporting*: the
+   * `provider_creds` row is only written when every project accepted the key,
+   * so a provider never shows "connected" while some project is missing it.
+   * Whatever did land stays on disk, and a retry is safe (`set-credential`
+   * overwrites), so the response names exactly which projects failed.
+   */
   app.post("/api/providers/:provider/connect", async (request, reply) => {
     const { provider } = request.params as { provider: string };
     const body = request.body as { type?: string; key?: string };
 
-    if (body.type === "api-key") {
-      if (!body.key || typeof body.key !== "string") {
-        return reply.code(400).send({ error: "key_required" });
-      }
-      const { callProjectctl } = await import("./queue.js");
-      const credName =
-        provider === "claude" ? "ANTHROPIC_API_KEY" : `${provider.toUpperCase()}_API_KEY`;
-      const result = await callProjectctl("set-credential", {
-        name: "_pm",
-        credential: credName,
-        value: body.key,
-      });
-
-      const masked =
-        body.key.length > 8
-          ? `${body.key.slice(0, 4)}${"*".repeat(body.key.length - 8)}${body.key.slice(-4)}`
-          : "****";
-
-      db.prepare(
-        "INSERT INTO provider_creds (provider, masked_key, connected_at) VALUES (?, ?, ?) ON CONFLICT(provider) DO UPDATE SET masked_key = excluded.masked_key, connected_at = excluded.connected_at",
-      ).run(provider, masked, new Date().toISOString());
-
-      return { ok: true, maskedKey: masked, projectctlOk: result.ok };
+    const credKey = PROVIDER_CREDENTIAL_KEYS[provider];
+    if (!credKey) return reply.code(404).send({ error: "unknown_provider" });
+    if (body?.type !== "api-key") return reply.code(400).send({ error: "unsupported_auth_type" });
+    if (!body.key || typeof body.key !== "string" || !body.key.trim()) {
+      return reply.code(400).send({ error: "key_required" });
     }
 
-    return reply.code(400).send({ error: "unsupported_auth_type" });
+    const key = body.key.trim();
+    const seed: CredentialSeed = { provider, key: credKey, value: key };
+    const projects = db.prepare("SELECT name FROM projects ORDER BY name").all() as {
+      name: string;
+    }[];
+
+    const results: DeliveryResult[] = [];
+    for (const project of projects) {
+      results.push(await deliverCredential(project.name, seed));
+    }
+
+    const failures = results.filter((result) => !result.ok);
+    if (failures.length > 0) {
+      return reply.code(502).send({
+        ok: false,
+        error: "credential_delivery_failed",
+        message: `wrote the key to ${results.length - failures.length} of ${results.length} projects`,
+        failures: failures.map((f) => ({ project: f.project, message: f.message })),
+      });
+    }
+
+    // Zero projects is a clean success: the key is held and every project
+    // created from here on is seeded with it (see POST /api/projects).
+    const masked = maskKey(key);
+    db.prepare(
+      "INSERT INTO provider_creds (provider, masked_key, secret, connected_at) VALUES (?, ?, ?, ?) ON CONFLICT(provider) DO UPDATE SET masked_key = excluded.masked_key, secret = excluded.secret, connected_at = excluded.connected_at",
+    ).run(provider, masked, key, new Date().toISOString());
+
+    return { ok: true, maskedKey: masked, projectsUpdated: results.length };
   });
 
   app.patch("/api/projects/:name/defaults", async (request, reply) => {
