@@ -9,6 +9,7 @@ import {
   findTask,
   writeTaskDescription,
   moveTaskStatus,
+  type RunEvent,
   type TaskStatus,
 } from "@pm/core";
 import { reindexTask } from "./indexer/index.js";
@@ -62,6 +63,15 @@ function scheduleIdleDeactivation(
   // Cancel any existing timer for this project
   const existing = idleTimers.get(projectId);
   if (existing) clearTimeout(existing);
+
+  // The project is connected but has no active work and isn't pinned — that's
+  // 'idle', distinct from both 'active' (a run is in flight) and 'stopped'
+  // (the runner is down). Previously nothing ever wrote this state, so the
+  // header's idle badge color was dead code.
+  db.prepare("UPDATE projects SET lifecycle = 'idle', updated_at = ? WHERE id = ?").run(
+    new Date().toISOString(),
+    projectId,
+  );
 
   const timer = setTimeout(async () => {
     idleTimers.delete(projectId);
@@ -136,6 +146,43 @@ const PHASE_TARGET_STATUS: Record<string, TaskStatus> = {
 /** Phases that mean somebody is working on the task now. */
 const PHASES_STARTING_WORK = new Set(["implement", "verify", "review"]);
 
+/** A row from the runtime `runs` table (see db/migrations/0001_init.ts). */
+interface RunRow {
+  id: number;
+  project_id: number;
+  task_num: number;
+  phase: string;
+  provider: string;
+  model: string;
+  prompt: string | null;
+  status: string;
+  exit_code: number | null;
+  log_path: string | null;
+  artifacts_dir: string | null;
+  cost_usd: number | null;
+  tokens_in: number | null;
+  tokens_out: number | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+interface ProjectRow {
+  id: number;
+  name: string;
+  repo_dir: string;
+  runner_socket: string | null;
+  default_provider: string | null;
+  default_model: string | null;
+  contract_json: string | null;
+  lifecycle: string;
+  always_on: number;
+  idle_timeout_ms: number | null;
+  run_timeout_ms: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface QueueManagerOptions {
   /**
    * Whether the queue may actually start runs. Off by default under
@@ -143,14 +190,14 @@ export interface QueueManagerOptions {
    */
   readonly autoStart?: boolean;
   /** Test seam: replaces the real executor. */
-  readonly execute?: (run: any) => Promise<void>;
+  readonly execute?: (run: RunRow) => Promise<void>;
 }
 
 export class QueueManager {
   private processing = false;
   private stopped = false;
   private readonly autoStart: boolean;
-  private readonly execute: (run: any) => Promise<void>;
+  private readonly execute: (run: RunRow) => Promise<void>;
 
   constructor(
     private readonly db: Database.Database,
@@ -188,26 +235,29 @@ export class QueueManager {
       while (true) {
         // 1. Check global concurrency limit
         const activeCount = (
-          this.db.prepare("SELECT COUNT(*) as count FROM runs WHERE status = 'running'").get() as any
+          this.db
+            .prepare("SELECT COUNT(*) as count FROM runs WHERE status = 'running'")
+            .get() as { count: number }
         ).count;
         if (activeCount >= limit) break;
 
         // 2. Get queued runs
         const queued = this.db
           .prepare("SELECT * FROM runs WHERE status = 'queued' ORDER BY id")
-          .all() as any[];
+          .all() as RunRow[];
         if (queued.length === 0) break;
 
         // 3. Find the first queued run that doesn't have an active run on the same task
-        let runToStart = null;
+        let runToStart: RunRow | null = null;
         for (const run of queued) {
-          const taskActive = (
-            this.db
-              .prepare(
-                "SELECT COUNT(*) as count FROM runs WHERE task_num = ? AND project_id = ? AND status = 'running'",
-              )
-              .get(run.task_num, run.project_id) as any
-          ).count > 0;
+          const taskActive =
+            (
+              this.db
+                .prepare(
+                  "SELECT COUNT(*) as count FROM runs WHERE task_num = ? AND project_id = ? AND status = 'running'",
+                )
+                .get(run.task_num, run.project_id) as { count: number }
+            ).count > 0;
           if (!taskActive) {
             runToStart = run;
             break;
@@ -237,18 +287,18 @@ export class QueueManager {
    * queued, so two passes of the loop (or two callers of trigger()) cannot
    * both claim it.
    */
-  private claim(run: { id: number }): boolean {
+  private claim(run: RunRow): boolean {
     const startedAt = new Date().toISOString();
     const result = this.db
       .prepare("UPDATE runs SET status = 'running', started_at = ? WHERE id = ? AND status = 'queued'")
       .run(startedAt, run.id);
     if (result.changes === 0) return false;
-    (run as any).status = "running";
-    (run as any).started_at = startedAt;
+    run.status = "running";
+    run.started_at = startedAt;
     return true;
   }
 
-  private async executeRun(run: any): Promise<void> {
+  private async executeRun(run: RunRow): Promise<void> {
     if (this.stopped) {
       // Shut down between the claim and the start: hand the row back.
       this.db
@@ -259,16 +309,13 @@ export class QueueManager {
     try {
       const project = this.db
         .prepare("SELECT * FROM projects WHERE id = ?")
-        .get(run.project_id) as any;
+        .get(run.project_id) as ProjectRow | undefined;
       if (!project) throw new Error("Project not found");
 
       // Auto-activate project if stopped; cancel any pending idle timer
       cancelIdleTimer(project.id);
       if (this.runners.state(project.name) !== "connected") {
         await callProjectctl("start", { name: project.name });
-        this.db
-          .prepare("UPDATE projects SET lifecycle = 'active', updated_at = ? WHERE id = ?")
-          .run(new Date().toISOString(), project.id);
         let elapsed = 0;
         while (this.runners.state(project.name) !== "connected" && elapsed < 10000) {
           await new Promise((r) => setTimeout(r, 100));
@@ -278,6 +325,12 @@ export class QueueManager {
           throw new Error("Failed to activate project runner");
         }
       }
+      // A project can already be 'connected' but sitting in 'idle' (timer
+      // pending, no runner restart needed) — mark it active unconditionally
+      // whenever a run actually starts, not only on the cold-start path.
+      this.db
+        .prepare("UPDATE projects SET lifecycle = 'active', updated_at = ? WHERE id = ?")
+        .run(new Date().toISOString(), project.id);
 
       const client = this.runners.client(project.name);
       if (!client) throw new Error("Runner client not connected");
@@ -332,7 +385,7 @@ export class QueueManager {
       await mkdir(logDir, { recursive: true });
       const logFilePath = join(logDir, `run-${run.id}.jsonl`);
 
-      const logEvents: any[] = [];
+      const logEvents: RunEvent[] = [];
 
       // Stream logs and write to file
       const streamResult = await client.call("streamLogs", { runId: run.id }, async (event) => {
@@ -379,9 +432,14 @@ export class QueueManager {
         finishedAt: new Date().toISOString(),
       };
 
-      // The per-task runs/NNNN.md numbering is the repo's own sequence, not
-      // the execution id — addRunOutcome picks the next free one.
-      await addRunOutcome(currentTask, frontMatter, finalOutcome);
+      // Force the repo-side runs/NNNN.md number to equal pm's own runtime
+      // run id, rather than letting addRunOutcome pick the next free one in
+      // sequence. This is what makes task_runs.run_num == runs.id — the
+      // basis for correlating a repo-side run to its runtime run everywhere
+      // else (the UI timeline, the artifacts routes) instead of matching on
+      // (phase, started_at), which collides on same-millisecond starts or a
+      // null started_at.
+      await addRunOutcome(currentTask, frontMatter, finalOutcome, { num: run.id });
 
       if (status === "succeeded") {
         if (run.phase === "interview") {

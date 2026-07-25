@@ -58,8 +58,8 @@ export class AntigravityAdapter implements ProviderAdapter {
 
   async models(): Promise<Model[]> {
     return [
-      { id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5 (via Antigravity)" },
-      { id: "claude-3-7-sonnet-latest", name: "Claude 3.7 Sonnet (via Antigravity)" },
+      { id: "claude-sonnet-5", name: "Claude Sonnet 5 (via Antigravity)" },
+      { id: "claude-opus-5", name: "Claude Opus 5 (via Antigravity)" },
       { id: "gemini-2.5-pro", name: "Gemini 2.5 Pro (via Antigravity)" },
       { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash (via Antigravity)" },
     ];

@@ -332,6 +332,20 @@ export async function fetchAdrs(project: string): Promise<Adr[]> {
   return body.adrs;
 }
 
+export interface SearchResult {
+  readonly type: "task" | "spec" | "adr";
+  readonly title: string;
+  readonly snippet: string;
+  readonly taskNum?: number;
+}
+
+export async function searchProject(project: string, query: string): Promise<SearchResult[]> {
+  const body = await getJson<{ results: SearchResult[] }>(
+    `/api/projects/${project}/search?q=${encodeURIComponent(query)}`,
+  );
+  return body.results;
+}
+
 // ─── Cost roll-ups (T37) ─────────────────────────────────────────────────────
 
 export interface MtdCost {

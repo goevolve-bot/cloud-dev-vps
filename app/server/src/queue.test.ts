@@ -4,9 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import type Database from "better-sqlite3";
+import type { RunnerEvent } from "@pm/core";
 import { openDb } from "./db/connection.js";
 import { migrateUp } from "./db/migrate.js";
 import { QueueManager } from "./queue.js";
+import type { RunnerRegistry } from "./runners/registry.js";
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -58,12 +60,21 @@ after(async () => {
   await rm(dataDir, { recursive: true, force: true });
 });
 
-/** A registry whose runner is always up and answers with `client`. */
-function fakeRegistry(client: unknown): any {
+/**
+ * A registry whose runner is always up and answers with `client`. RunnerRegistry
+ * is a class with private fields, so a plain test double can never satisfy it
+ * structurally — the `unknown` round-trip is the standard way to hand a fake to
+ * code that only calls its public `state`/`client` methods.
+ */
+function fakeRegistry(client: unknown): RunnerRegistry {
   return {
     state: () => "connected",
     client: () => client,
-  };
+  } as unknown as RunnerRegistry;
+}
+
+interface RunStatusRow {
+  readonly status: string;
 }
 
 // ─── Scheduling ──────────────────────────────────────────────────────────────
@@ -91,7 +102,7 @@ test("a queued run is started exactly once, even while its executor is still awa
 
     assert.deepEqual(started, [runId]);
     assert.equal(
-      (db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as any).status,
+      (db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as RunStatusRow).status,
       "running",
     );
     await sleep(60);
@@ -147,7 +158,7 @@ test("init drains runs that were still queued at shutdown", async () => {
     await sleep(40);
 
     assert.equal(
-      (db.prepare("SELECT status FROM runs WHERE id = ?").get(interrupted) as any).status,
+      (db.prepare("SELECT status FROM runs WHERE id = ?").get(interrupted) as RunStatusRow).status,
       "interrupted",
     );
     assert.deepEqual(started, [stranded]);
@@ -210,9 +221,17 @@ test("two queued runs on the same task never run at once", async () => {
 
 // ─── Executing a run against a fake runner ───────────────────────────────────
 
+interface FakeCallArgs {
+  readonly runId?: number;
+  readonly phase?: string;
+  readonly branch?: string;
+  readonly base?: string;
+  readonly timeoutMs?: number;
+}
+
 interface RunnerCall {
   readonly verb: string;
-  readonly args: any;
+  readonly args: FakeCallArgs;
 }
 
 interface FakeRunnerOptions {
@@ -228,16 +247,22 @@ function fakeRunnerClient(calls: RunnerCall[], opts: FakeRunnerOptions = {}) {
   ];
   const hung = new Set<number>();
   return {
-    call: async (verb: string, args: any, onEvent?: (event: any) => Promise<void>) => {
+    call: async (
+      verb: string,
+      args: FakeCallArgs,
+      onEvent?: (event: RunnerEvent) => Promise<void>,
+    ) => {
       calls.push({ verb, args });
       if (verb === "startRun") {
-        if (opts.hangOnPhases?.includes(args.phase)) hung.add(args.runId);
+        if (args.phase && opts.hangOnPhases?.includes(args.phase) && args.runId !== undefined) {
+          hung.add(args.runId);
+        }
         return { runId: args.runId, status: "running" };
       }
       if (verb === "streamLogs") {
-        if (hung.has(args.runId)) return new Promise(() => {});
+        if (args.runId !== undefined && hung.has(args.runId)) return new Promise(() => {});
         for (const line of lines) {
-          await onEvent?.({ type: "log", runId: args.runId, line });
+          await onEvent?.({ type: "log", runId: args.runId ?? -1, line });
         }
         return { runId: args.runId, complete: true, exitCode: opts.exitCode ?? 0 };
       }
@@ -260,11 +285,17 @@ async function makeRepo(): Promise<{ dir: string; taskDir: string; cleanup: () =
   return { dir, taskDir, cleanup: () => rm(dir, { recursive: true, force: true }) };
 }
 
+interface RunRow {
+  readonly id: number;
+  readonly status: string;
+  readonly exit_code: number | null;
+}
+
 /** Runs the queue until `runId` reaches a terminal status. */
-async function runToCompletion(db: Database.Database, queue: QueueManager, runId: number) {
+async function runToCompletion(db: Database.Database, queue: QueueManager, runId: number): Promise<RunRow> {
   queue.trigger();
   for (let i = 0; i < 200; i++) {
-    const row = db.prepare("SELECT * FROM runs WHERE id = ?").get(runId) as any;
+    const row = db.prepare("SELECT * FROM runs WHERE id = ?").get(runId) as RunRow;
     if (row.status !== "queued" && row.status !== "running") return row;
     await sleep(10);
   }
@@ -294,7 +325,7 @@ test("an implement run carries pm's run id, pushes its branch, and queues verify
     const start = calls.find((c) => c.verb === "startRun");
     assert.equal(start?.args.runId, runId);
     assert.equal(calls.find((c) => c.verb === "streamLogs")?.args.runId, runId);
-    assert.ok(start?.args.timeoutMs > 0);
+    assert.ok((start?.args.timeoutMs ?? 0) > 0);
 
     // §3.1: the branch is committed and pushed, so the follow-on verify sees it.
     const branchPush = calls.filter((c) => c.verb === "commitAndPush").map((c) => c.args.branch);
@@ -302,12 +333,14 @@ test("an implement run carries pm's run id, pushes its branch, and queues verify
     assert.ok(branchPush.includes("pm/task-1-demo"), "the task branch is pushed");
 
     // §3.11: the board follows along on its own.
-    const task = db.prepare("SELECT status FROM tasks WHERE project_id = ? AND task_num = 1").get(projectId) as any;
+    const task = db
+      .prepare("SELECT status FROM tasks WHERE project_id = ? AND task_num = 1")
+      .get(projectId) as RunStatusRow;
     assert.equal(task.status, "in-progress");
 
     const verify = db
       .prepare("SELECT * FROM runs WHERE project_id = ? AND phase = 'verify'")
-      .get(projectId) as any;
+      .get(projectId) as RunRow | undefined;
     assert.ok(verify, "a verify run is queued after a successful implement run");
   } finally {
     // No db.close(): the queue polls it, and a stopped queue can still have
@@ -365,11 +398,17 @@ test("an agent that exits 0 without any JSON result still counts as a success", 
   }
 });
 
-test("a successful verify run moves the task to ready for review", async () => {
+test("a successful verify run moves the task to ready for review, filed under pm's own run id", async () => {
   const repo = await makeRepo();
   const db = newDb();
   try {
     const projectId = insertProject(db, "demo", repo.dir);
+    // A prior run on the same task bumps the runtime run id away from 1, so
+    // this test actually distinguishes "the outcome file is numbered by
+    // runs.id" from "numbered by the task's own next-in-sequence counter" —
+    // on a fresh DB the two would coincide and the assertion would pass
+    // either way.
+    queueRun(db, projectId, 1, "plan");
     const runId = queueRun(db, projectId, 1, "verify");
 
     const queue = new QueueManager(db, fakeRegistry(fakeRunnerClient([])), { autoStart: true });
@@ -378,13 +417,23 @@ test("a successful verify run moves the task to ready for review", async () => {
 
     const task = db
       .prepare("SELECT status FROM tasks WHERE project_id = ? AND task_num = 1")
-      .get(projectId) as any;
+      .get(projectId) as RunStatusRow;
     assert.equal(task.status, "ready-for-review");
 
-    // The outcome file lands under the task's own sequential numbering, not
-    // under the execution id.
+    // The outcome file is numbered by pm's own runtime run id, not by the
+    // task's own next-in-sequence counter — this is what lets the UI
+    // correlate a repo-side run to its runtime run by identity instead of a
+    // (phase, started_at) heuristic.
     const outcome = await readFile(
-      join(repo.dir, ".pm", "tasks", "ready-for-review", "0001-demo", "runs", "0001.md"),
+      join(
+        repo.dir,
+        ".pm",
+        "tasks",
+        "ready-for-review",
+        "0001-demo",
+        "runs",
+        `${String(runId).padStart(4, "0")}.md`,
+      ),
       "utf8",
     );
     assert.match(outcome, /phase: verify/);

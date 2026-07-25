@@ -22,31 +22,33 @@ export function SettingsModal({ currentProject, onClose, onProjectUpdated }: Set
   const [connectMsg, setConnectMsg] = useState<Record<string, string>>({});
   const [connectFailed, setConnectFailed] = useState<Record<string, boolean>>({});
   const [defProvider, setDefProvider] = useState(currentProject?.defaultProvider ?? "claude");
-  const [defModel, setDefModel] = useState(
-    currentProject?.defaultModel ?? "claude-3-5-sonnet-latest",
-  );
+  const [defModel, setDefModel] = useState(currentProject?.defaultModel ?? "");
   const [savingDefaults, setSavingDefaults] = useState(false);
   const [togglingAlwaysOn, setTogglingAlwaysOn] = useState(false);
 
-  const availableModels =
-    providers.find((p) => p.id === defProvider)?.models ??
-    (defProvider === "claude"
-      ? [
-          { id: "claude-3-5-sonnet-latest", name: "Claude 3.5 Sonnet" },
-          { id: "claude-3-5-haiku-latest", name: "Claude 3.5 Haiku" },
-          { id: "claude-3-opus-latest", name: "Claude 3 Opus" },
-        ]
-      : []);
+  // Models come exclusively from the fetched providers — each adapter's
+  // models() is the single source of truth, not a copy baked into the UI.
+  const availableModels = providers.find((p) => p.id === defProvider)?.models ?? [];
 
   useEffect(() => {
-    void fetchProviders().then(setProviders).catch(console.error);
+    void fetchProviders()
+      .then((data) => {
+        setProviders(data);
+        // No default picked yet (new project, or nothing saved): fall back to
+        // the current provider's first model once the real list has loaded.
+        if (!defModel) {
+          const firstModel = data.find((p) => p.id === defProvider)?.models[0];
+          if (firstModel) setDefModel(firstModel.id);
+        }
+      })
+      .catch(console.error);
   }, []);
 
   // Sync defaults from project
   useEffect(() => {
     if (currentProject) {
       setDefProvider(currentProject.defaultProvider ?? "claude");
-      setDefModel(currentProject.defaultModel ?? "claude-3-5-sonnet-latest");
+      setDefModel(currentProject.defaultModel ?? "");
     }
   }, [currentProject]);
 

@@ -9,6 +9,7 @@ import {
   addComment,
   createTask,
   findTask,
+  getAdapter,
   isTaskStatus,
   listAttachments,
   moveTaskStatus,
@@ -54,6 +55,26 @@ interface TaskRow {
   readonly branch: string | null;
   readonly created_at: string;
   readonly updated_at: string;
+}
+
+interface RunRow {
+  readonly id: number;
+  readonly project_id: number;
+  readonly task_num: number;
+  readonly phase: string;
+  readonly provider: string;
+  readonly model: string;
+  readonly prompt: string | null;
+  readonly status: string;
+  readonly exit_code: number | null;
+  readonly log_path: string | null;
+  readonly artifacts_dir: string | null;
+  readonly cost_usd: number | null;
+  readonly tokens_in: number | null;
+  readonly tokens_out: number | null;
+  readonly created_at: string;
+  readonly started_at: string | null;
+  readonly finished_at: string | null;
 }
 
 function serializeProject(row: ProjectRow, runnerState: string) {
@@ -116,6 +137,24 @@ function extFor(mimeType: string): string {
   return found?.[0] ?? "bin";
 }
 
+/** A short window of `text` around the first case-insensitive match of `needle`. */
+function snippetAround(text: string, needle: string, radius = 60): string {
+  const idx = text.toLowerCase().indexOf(needle);
+  if (idx === -1) return text.slice(0, radius * 2).trim();
+  const start = Math.max(0, idx - radius);
+  const end = Math.min(text.length, idx + needle.length + radius);
+  const prefix = start > 0 ? "…" : "";
+  const suffix = end < text.length ? "…" : "";
+  return `${prefix}${text.slice(start, end).trim()}${suffix}`;
+}
+
+interface SearchResult {
+  readonly type: "task" | "spec" | "adr";
+  readonly title: string;
+  readonly snippet: string;
+  readonly taskNum?: number;
+}
+
 // Mirrors pm-projectctl's NAME_RE. Checking here too means a bad name is a
 // 400 with a useful message rather than an `invalid_name` error arriving
 // halfway through an SSE stream.
@@ -147,6 +186,15 @@ const SAFE_FILENAME_RE = /^[^/\\]+$/;
 
 function isSafeFilename(name: string): boolean {
   return SAFE_FILENAME_RE.test(name) && name !== "." && name !== ".." && !name.includes("\0");
+}
+
+// runNum is interpolated straight into a filesystem path (verify-artifacts/<runNum>
+// and PM_DATA_DIR/artifacts/<runNum>); it must be digits only or a request like
+// runNum=../../.. reads/lists arbitrary paths reachable by the pm user.
+const RUN_NUM_RE = /^\d+$/;
+
+function isSafeRunNum(runNum: string): boolean {
+  return RUN_NUM_RE.test(runNum);
 }
 
 /**
@@ -224,6 +272,10 @@ export function buildApp(ctx: AppContext): FastifyInstance {
 
   function getProjectRow(name: string): ProjectRow | undefined {
     return db.prepare("SELECT * FROM projects WHERE name = ?").get(name) as ProjectRow | undefined;
+  }
+
+  function getProjectById(id: number): ProjectRow | undefined {
+    return db.prepare("SELECT * FROM projects WHERE id = ?").get(id) as ProjectRow | undefined;
   }
 
   function getTaskRow(projectId: number, taskNum: number): TaskRow | undefined {
@@ -532,6 +584,57 @@ export function buildApp(ctx: AppContext): FastifyInstance {
     return { adrs };
   });
 
+  // Case-insensitive substring search across what's already cached for the
+  // project: tasks (from the DB) and specs/ADRs (read fresh from .pm/, same
+  // as their own list routes — there is no separate search index).
+  app.get("/api/projects/:name/search", async (request, reply) => {
+    const { name } = request.params as { name: string };
+    const { q } = request.query as { q?: string };
+    const project = getProjectRow(name);
+    if (!project) return reply.code(404).send({ error: "project_not_found" });
+
+    const query = (q ?? "").trim();
+    if (!query) return { results: [] };
+    const needle = query.toLowerCase();
+
+    const results: SearchResult[] = [];
+
+    const taskRows = db
+      .prepare("SELECT task_num, title, description FROM tasks WHERE project_id = ?")
+      .all(project.id) as { task_num: number; title: string; description: string }[];
+    for (const row of taskRows) {
+      const haystack = `${row.title}\n${row.description}`.toLowerCase();
+      if (!haystack.includes(needle)) continue;
+      results.push({
+        type: "task",
+        taskNum: row.task_num,
+        title: `#${row.task_num} ${row.title}`,
+        snippet: snippetAround(row.description || row.title, needle),
+      });
+    }
+
+    if (project.repo_dir) {
+      const pmDir = pmDirFor(project.repo_dir);
+      const [specs, adrs] = await Promise.all([listSpecs(pmDir), listAdrs(pmDir)]);
+      for (const spec of specs) {
+        const haystack = `${spec.name}\n${spec.body}`.toLowerCase();
+        if (!haystack.includes(needle)) continue;
+        results.push({ type: "spec", title: spec.name, snippet: snippetAround(spec.body, needle) });
+      }
+      for (const adr of adrs) {
+        const haystack = `${adr.title}\n${adr.body}`.toLowerCase();
+        if (!haystack.includes(needle)) continue;
+        results.push({
+          type: "adr",
+          title: `ADR ${adr.id}: ${adr.title}`,
+          snippet: snippetAround(adr.body, needle),
+        });
+      }
+    }
+
+    return { results: results.slice(0, 30) };
+  });
+
   app.post("/api/projects/:name/tasks", async (request, reply) => {
     const { name } = request.params as { name: string };
     const project = getProjectRow(name);
@@ -720,7 +823,7 @@ export function buildApp(ctx: AppContext): FastifyInstance {
 
   app.post("/api/runs/:id/stop", async (request, reply) => {
     const { id } = request.params as { id: string };
-    const run = db.prepare("SELECT * FROM runs WHERE id = ?").get(Number(id)) as any;
+    const run = db.prepare("SELECT * FROM runs WHERE id = ?").get(Number(id)) as RunRow | undefined;
     if (!run) return reply.code(404).send({ error: "run_not_found" });
     if (run.status !== "running" && run.status !== "queued") {
       return reply.code(409).send({ error: "run_not_active" });
@@ -731,7 +834,8 @@ export function buildApp(ctx: AppContext): FastifyInstance {
       return { stopped: true };
     }
 
-    const project = db.prepare("SELECT * FROM projects WHERE id = ?").get(run.project_id) as any;
+    const project = getProjectById(run.project_id);
+    if (!project) return reply.code(404).send({ error: "project_not_found" });
     const client = runners.client(project.name);
     if (!client) return reply.code(409).send({ error: "runner_not_connected" });
 
@@ -747,7 +851,7 @@ export function buildApp(ctx: AppContext): FastifyInstance {
   app.get("/api/runs/:id/events", (request, reply) => {
     const { id } = request.params as { id: string };
     const runId = Number(id);
-    const run = db.prepare("SELECT * FROM runs WHERE id = ?").get(runId) as any;
+    const run = db.prepare("SELECT * FROM runs WHERE id = ?").get(runId) as RunRow | undefined;
     if (!run) {
       reply.code(404).send({ error: "run_not_found" });
       return;
@@ -807,20 +911,27 @@ export function buildApp(ctx: AppContext): FastifyInstance {
     });
   });
 
+  // Verify artifacts live in PM_DATA_DIR, not the repo working tree — queue.ts
+  // copies them there after a verify run so they survive a rebuild of the repo's
+  // .pm/ cache. `runNum` is `task_runs.run_num`, which queue.ts now forces to
+  // equal the runtime `runs.id`, so it doubles as the artifacts directory name.
+  // TODO(retention): PM_DATA_DIR/artifacts grows without bound — the plan calls
+  // for retention on raw logs and verify artifacts, but no policy (age, count,
+  // size) is specified anywhere. Needs a decision before this ships long-term.
+
   app.get("/api/projects/:name/tasks/:taskNum/runs/:runNum/artifacts", async (request, reply) => {
     const { name, runNum } = request.params as {
       name: string;
       runNum: string;
     };
+    if (!isSafeRunNum(runNum)) return reply.code(400).send({ error: "invalid_run_num" });
     const project = getProjectRow(name);
     if (!project) return reply.code(404).send({ error: "project_not_found" });
-    if (!project.repo_dir) return reply.code(409).send({ error: "project_has_no_repo" });
 
-    const repoPmDir = pmDirFor(project.repo_dir);
-    const runArtifactsDir = join(repoPmDir, "verify-artifacts", runNum);
+    const artifactsDir = join(process.env.PM_DATA_DIR || ".", "artifacts", runNum);
 
     try {
-      const files = await readdir(runArtifactsDir);
+      const files = await readdir(artifactsDir);
       return { artifacts: files };
     } catch {
       return { artifacts: [] };
@@ -833,14 +944,13 @@ export function buildApp(ctx: AppContext): FastifyInstance {
       runNum: string;
       filename: string;
     };
+    if (!isSafeRunNum(runNum)) return reply.code(400).send({ error: "invalid_run_num" });
     if (!isSafeFilename(filename)) return reply.code(400).send({ error: "invalid_filename" });
-    
+
     const project = getProjectRow(name);
     if (!project) return reply.code(404).send({ error: "project_not_found" });
-    if (!project.repo_dir) return reply.code(409).send({ error: "project_has_no_repo" });
 
-    const repoPmDir = pmDirFor(project.repo_dir);
-    const filePath = join(repoPmDir, "verify-artifacts", runNum, filename);
+    const filePath = join(process.env.PM_DATA_DIR || ".", "artifacts", runNum, filename);
 
     try {
       const data = readFileSync(filePath);
@@ -851,12 +961,16 @@ export function buildApp(ctx: AppContext): FastifyInstance {
   });
 
   // ─── Cost roll-ups (T37) ─────────────────────────────────────────────────
+  // Aggregated from task_runs (the .pm/ cache), not the runtime `runs` table —
+  // costs are written into the run's outcome file in .pm/, so totals survive
+  // a cache rebuild. The runtime table is wiped on restart in ways task_runs
+  // is not.
 
   app.get("/api/costs/mtd", async () => {
     const month = new Date().toISOString().slice(0, 7); // "YYYY-MM"
     const row = db
       .prepare(
-        "SELECT COALESCE(SUM(cost_usd), 0) as total FROM runs WHERE cost_usd IS NOT NULL AND created_at LIKE ?",
+        "SELECT COALESCE(SUM(cost_usd), 0) as total FROM task_runs WHERE cost_usd IS NOT NULL AND finished_at LIKE ?",
       )
       .get(`${month}%`) as { total: number };
     return { totalUsd: row.total, month };
@@ -869,14 +983,14 @@ export function buildApp(ctx: AppContext): FastifyInstance {
 
     const taskTotals = db
       .prepare(
-        "SELECT task_num, COALESCE(SUM(cost_usd), 0) as total_usd FROM runs WHERE project_id = ? AND cost_usd IS NOT NULL GROUP BY task_num",
+        "SELECT task_num, COALESCE(SUM(cost_usd), 0) as total_usd FROM task_runs WHERE project_id = ? AND cost_usd IS NOT NULL GROUP BY task_num",
       )
       .all(project.id) as { task_num: number; total_usd: number }[];
 
     const projectTotal = (
       db
         .prepare(
-          "SELECT COALESCE(SUM(cost_usd), 0) as total FROM runs WHERE project_id = ? AND cost_usd IS NOT NULL",
+          "SELECT COALESCE(SUM(cost_usd), 0) as total FROM task_runs WHERE project_id = ? AND cost_usd IS NOT NULL",
         )
         .get(project.id) as { total: number }
     ).total;
@@ -922,35 +1036,29 @@ export function buildApp(ctx: AppContext): FastifyInstance {
 
   // ─── Providers (T36) ─────────────────────────────────────────────────────
 
+  // Provider id -> display metadata. The model list itself is *not* here —
+  // it comes from each adapter's models(), which is the single source of
+  // truth (see core/src/pm/adapters/*.ts). Two copies of the same list going
+  // stale independently is exactly what broke this before.
+  const PROVIDER_META: Record<string, { name: string; authType: "api-key" | "oauth" }> = {
+    claude: { name: "Claude (Anthropic)", authType: "api-key" },
+    // TODO: antigravity is an OAuth product and `agy auth login` is the
+    // native flow, but no OAuth handler exists anywhere in pm — advertising
+    // "oauth" here while the UI only offers a key field was a straight
+    // contradiction. Until that flow is built this is an API key like any
+    // other; revisit when there is something to redirect to.
+    antigravity: { name: "Antigravity", authType: "api-key" },
+  };
+
   app.get("/api/providers", async () => {
-    const providerDefs = [
-      {
-        id: "claude",
-        name: "Claude (Anthropic)",
-        authType: "api-key" as const,
-        models: [
-          { id: "claude-3-5-sonnet-latest", name: "Claude 3.5 Sonnet" },
-          { id: "claude-3-5-haiku-latest", name: "Claude 3.5 Haiku" },
-          { id: "claude-3-opus-latest", name: "Claude 3 Opus" },
-        ],
-      },
-      {
-        id: "antigravity",
-        // TODO: antigravity is an OAuth product and `agy auth login` is the
-        // native flow, but no OAuth handler exists anywhere in pm — advertising
-        // "oauth" here while the UI only offers a key field was a straight
-        // contradiction. Until that flow is built this is an API key like any
-        // other; revisit when there is something to redirect to.
-        name: "Antigravity",
-        authType: "api-key" as const,
-        models: [
-          { id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5 (via AGY)" },
-          { id: "claude-3-7-sonnet-latest", name: "Claude 3.7 Sonnet (via AGY)" },
-          { id: "gemini-2.5-pro", name: "Gemini 2.5 Pro (via AGY)" },
-          { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash (via AGY)" },
-        ],
-      },
-    ];
+    const providerDefs = await Promise.all(
+      Object.entries(PROVIDER_META).map(async ([id, meta]) => ({
+        id,
+        name: meta.name,
+        authType: meta.authType,
+        models: await getAdapter(id).models(),
+      })),
+    );
 
     const credRows = db.prepare("SELECT * FROM provider_creds").all() as {
       provider: string;

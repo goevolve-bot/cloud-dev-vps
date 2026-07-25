@@ -30,8 +30,8 @@ export function AdrsPage({ project }: AdrsPageProps) {
         }
         const proj = projectsList.find((p) => p.name === project);
         setGitUrl(proj?.gitUrl);
-      } catch (err: any) {
-        setError(err.message || "Failed to load ADRs.");
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Failed to load ADRs.");
       } finally {
         setLoading(false);
       }

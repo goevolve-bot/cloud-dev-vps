@@ -8,11 +8,12 @@ import type { RunnerMessage } from "@pm/core";
 import { createRunnerServer } from "./socket-server.js";
 import { childProcess } from "./exec.js";
 import { EventEmitter } from "node:events";
+import type { ChildProcess, ExecFileOptions } from "node:child_process";
 
 let tempDir: string;
 let repoDir: string;
 let socketPath: string;
-let server: any;
+let server: ReturnType<typeof createRunnerServer> | undefined;
 
 const originalExecFile = childProcess.execFile;
 const originalSpawn = childProcess.spawn;
@@ -55,30 +56,42 @@ before(async () => {
   os.homedir = () => tempDir;
   process.env.PM_REPO_DIR = repoDir;
 
-  childProcess.execFile = ((file: string, args: string[], opts: any, callback: any) => {
+  type ExecFileCallback = (
+    error: Error | null,
+    result?: { stdout: string; stderr: string },
+  ) => void;
+
+  childProcess.execFile = ((
+    file: string,
+    args: string[],
+    opts: ExecFileOptions | ExecFileCallback,
+    callback?: ExecFileCallback,
+  ) => {
     const cb = typeof opts === "function" ? opts : callback;
-    const cwd = typeof opts === "object" && opts ? opts.cwd : undefined;
+    const cwd = typeof opts === "object" && opts && typeof opts.cwd === "string" ? opts.cwd : undefined;
     execCalls.push({ file, args, cwd });
 
     const reply = file === "git" ? gitReply(args, cwd) : "";
     if (reply instanceof Error) {
-      cb(reply);
+      cb?.(reply);
       return;
     }
-    cb(null, { stdout: reply, stderr: "" });
-  }) as any;
+    cb?.(null, { stdout: reply, stderr: "" });
+  }) as unknown as typeof childProcess.execFile;
+
+  /** A bare EventEmitter with just enough of the Readable surface the runner touches. */
+  function fakeReadable(): EventEmitter & { setEncoding: (enc: string) => void } {
+    const emitter = new EventEmitter() as EventEmitter & { setEncoding: (enc: string) => void };
+    emitter.setEncoding = () => {};
+    return emitter;
+  }
 
   childProcess.spawn = ((file: string, args: string[]) => {
     spawnCalls.push({ file, args });
-    const stdout = new EventEmitter() as any;
-    stdout.setEncoding = () => {};
-    const stderr = new EventEmitter() as any;
-    stderr.setEncoding = () => {};
-    const child = new EventEmitter() as any;
-    child.stdout = stdout;
-    child.stderr = stderr;
-    child.pid = 99999;
-    child.kill = () => {};
+    const stdout = fakeReadable();
+    const stderr = fakeReadable();
+    const child = new EventEmitter() as unknown as ChildProcess;
+    Object.assign(child, { stdout, stderr, pid: 99999, kill: () => true });
 
     process.nextTick(() => {
       stdout.emit("data", '{"type":"assistant","message":"thinking"}\n');
@@ -90,7 +103,7 @@ before(async () => {
     });
 
     return child;
-  }) as any;
+  }) as unknown as typeof childProcess.spawn;
 
   for (const [num, slug] of [
     [1, "demo"],
@@ -127,7 +140,8 @@ after(async () => {
   if (originalRepoDirEnv === undefined) delete process.env.PM_REPO_DIR;
   else process.env.PM_REPO_DIR = originalRepoDirEnv;
   if (server) {
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+    const s = server;
+    await new Promise<void>((resolve) => s.close(() => resolve()));
   }
   await rm(tempDir, { recursive: true, force: true });
 });
@@ -164,10 +178,11 @@ async function call(
   });
 }
 
-function resultData(messages: RunnerMessage[]): any {
+function resultData(messages: RunnerMessage[]): Record<string, unknown> {
   const last = messages[messages.length - 1];
   assert.equal(last.type, "result", `expected a result, got ${JSON.stringify(last)}`);
-  return (last as any).data;
+  if (last.type !== "result") throw new Error("unreachable — asserted above");
+  return last.data as unknown as Record<string, unknown>;
 }
 
 function startRun(args: Record<string, unknown>): Promise<RunnerMessage[]> {
@@ -223,7 +238,7 @@ test("startRun rejects a request without a pm-assigned run id", async () => {
     args: { taskId: 1, phase: "implement", provider: "claude", model: "m", prompt: "p" },
   });
   assert.equal(messages[0].type, "error");
-  assert.match((messages[0] as any).message, /runId/);
+  assert.ok(messages[0].type === "error" && /runId/.test(messages[0].message));
 });
 
 test("concurrent runs on different tasks get distinct log files and container names", async () => {
@@ -327,7 +342,7 @@ test("commitAndPush reports a rejected push instead of claiming success", async 
   assert.equal(data.pushed, false);
   // The work is committed locally, so the next run picks the branch back up.
   assert.equal(data.committed, true);
-  assert.match(data.error, /rejected/);
+  assert.match(data.error as string, /rejected/);
 });
 
 test("diff is computed by the runner, against the repo's default branch", async () => {
@@ -335,7 +350,7 @@ test("diff is computed by the runner, against the repo's default branch", async 
   const data = resultData(await call({ id: "diff-1", verb: "diff", args: { branch: "pm/task-1-demo" } }));
   assert.equal(data.found, true);
   assert.equal(data.base, "main");
-  assert.match(data.diff, /^diff --git/);
+  assert.match(data.diff as string, /^diff --git/);
 
   const diffCall = execCalls.find((c) => c.args[0] === "diff");
   assert.deepEqual(diffCall?.args, ["diff", "main...pm/task-1-demo"]);

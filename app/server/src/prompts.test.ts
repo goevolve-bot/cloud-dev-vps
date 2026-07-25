@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -96,15 +96,6 @@ test("composePrompt produces correct composed prompt for each phase", async () =
     // Write a plan file
     await writeFile(join(task.dir, "plan.md"), "# Implementation Plan\n1. Setup oauth\n");
 
-    // Re-run plan phase check
-    const planPromptWithPlan = await composePrompt({
-      phase: "plan",
-      task,
-      pmDir,
-      repoDir,
-      db,
-      projectId,
-    });
     // planPrompt doesn't embed plan, but implementPrompt does
     const implementPromptNonCompliant = await composePrompt({
       phase: "implement",
@@ -184,6 +175,24 @@ test("composePrompt produces correct composed prompt for each phase", async () =
   } finally {
     db.close();
     await rm(repoDir, { recursive: true, force: true });
+  }
+});
+
+test("prompt templates resolve at import.meta.dirname/../prompts for every phase", async () => {
+  // composePrompt resolves each phase's template with
+  // join(import.meta.dirname, "../prompts", `${phase}.txt`). That's correct
+  // for the built layout (server/dist/prompts.js and server/prompts/ are
+  // both one level under server/) and happens to be correct from a
+  // ts-node/tsx source run too (server/src/prompts.ts is at the same
+  // depth) — but nothing asserted that the formula, or the prompts/
+  // directory contents it depends on, actually holds. Compute the same
+  // path independently and confirm every phase file it names is really
+  // there.
+  const promptsDir = join(import.meta.dirname, "../prompts");
+  const phases = ["interview", "refine", "plan", "implement", "review"];
+  for (const phase of phases) {
+    const content = await readFile(join(promptsDir, `${phase}.txt`), "utf8");
+    assert.ok(content.length > 0, `${phase}.txt should be non-empty`);
   }
 });
 

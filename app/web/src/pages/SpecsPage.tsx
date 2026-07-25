@@ -30,8 +30,8 @@ export function SpecsPage({ project }: SpecsPageProps) {
         }
         const proj = projectsList.find((p) => p.name === project);
         setGitUrl(proj?.gitUrl);
-      } catch (err: any) {
-        setError(err.message || "Failed to load specs.");
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Failed to load specs.");
       } finally {
         setLoading(false);
       }

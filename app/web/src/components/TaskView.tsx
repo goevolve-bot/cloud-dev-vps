@@ -8,6 +8,7 @@ import {
   stopRun,
   answerQuestion,
   fetchProjectCosts,
+  fetchProviders,
   type Task,
   type TaskStatus,
   type Comment as ApiComment,
@@ -15,6 +16,7 @@ import {
   type QueueRun,
   type Question,
   type Project,
+  type ProviderInfo,
 } from "../api";
 import { useAttachments } from "../hooks/useAttachments";
 import { AttachmentsBar } from "./AttachmentsBar";
@@ -312,16 +314,27 @@ export function TaskView({ task, project, projectInfo, onSave, onStatusChange }:
   const [plan, setPlan] = useState<string | null>(null);
   const [taskCostTotal, setTaskCostTotal] = useState<number | null>(null);
 
+  const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [runPhase, setRunPhase] = useState("implement");
   const [runProvider, setRunProvider] = useState(projectInfo?.defaultProvider ?? "claude");
-  const [runModel, setRunModel] = useState(
-    projectInfo?.defaultModel ?? "claude-3-5-sonnet-latest",
-  );
+  const [runModel, setRunModel] = useState(projectInfo?.defaultModel ?? "");
   const [runPrompt, setRunPrompt] = useState("");
   const [runningAction, setRunningAction] = useState(false);
 
   const [commentBody, setCommentBody] = useState("");
   const [submittingComment, setSubmittingComment] = useState(false);
+
+  useEffect(() => {
+    void fetchProviders()
+      .then((data) => {
+        setProviders(data);
+        if (!runModel) {
+          const firstModel = data.find((p) => p.id === runProvider)?.models[0];
+          if (firstModel) setRunModel(firstModel.id);
+        }
+      })
+      .catch(console.error);
+  }, []);
 
   useEffect(() => {
     async function loadDetails() {
@@ -536,41 +549,38 @@ export function TaskView({ task, project, projectInfo, onSave, onStatusChange }:
                 <option value="refine">Refine</option>
                 <option value="plan">Plan</option>
                 <option value="implement">Implement</option>
+                <option value="verify">Verify</option>
                 <option value="review">Review</option>
               </select>
             </label>
             <label>
               Provider:
-              <select value={runProvider} onChange={(e) => {
-                setRunProvider(e.target.value);
-                // reset model when provider changes
-                if (e.target.value === "antigravity") {
-                  setRunModel("claude-sonnet-4-5");
-                } else {
-                  setRunModel("claude-3-5-sonnet-latest");
-                }
-              }}>
-                <option value="claude">Claude</option>
-                <option value="antigravity">Antigravity</option>
+              <select
+                value={runProvider}
+                onChange={(e) => {
+                  const newProvider = e.target.value;
+                  setRunProvider(newProvider);
+                  // Reset the model to the new provider's first model — the
+                  // old model id is almost certainly invalid for it.
+                  const firstModel = providers.find((p) => p.id === newProvider)?.models[0];
+                  setRunModel(firstModel?.id ?? "");
+                }}
+              >
+                {providers.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                  </option>
+                ))}
               </select>
             </label>
             <label>
               Model:
               <select value={runModel} onChange={(e) => setRunModel(e.target.value)}>
-                {runProvider === "antigravity" ? (
-                  <>
-                    <option value="claude-sonnet-4-5">Claude Sonnet 4.5 (via AGY)</option>
-                    <option value="claude-3-7-sonnet-latest">Claude 3.7 Sonnet (via AGY)</option>
-                    <option value="gemini-2.5-pro">Gemini 2.5 Pro (via AGY)</option>
-                    <option value="gemini-2.5-flash">Gemini 2.5 Flash (via AGY)</option>
-                  </>
-                ) : (
-                  <>
-                    <option value="claude-3-5-sonnet-latest">Claude 3.5 Sonnet</option>
-                    <option value="claude-3-5-haiku-latest">Claude 3.5 Haiku</option>
-                    <option value="claude-3-opus-latest">Claude 3 Opus</option>
-                  </>
-                )}
+                {(providers.find((p) => p.id === runProvider)?.models ?? []).map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.name}
+                  </option>
+                ))}
               </select>
             </label>
             <button
@@ -594,25 +604,20 @@ export function TaskView({ task, project, projectInfo, onSave, onStatusChange }:
           </div>
           <div className="launch-bar-quick">
             <span className="small-label muted">Quick Actions:</span>
-            <button
-              type="button"
-              className="chip"
-              onClick={() => void launchRun("plan", "claude", "claude-3-5-sonnet-latest")}
-            >
+            {/* Quick actions launch with whatever provider/model is currently
+                selected above, just overriding the phase — they used to hardcode
+                a provider/model pair that went stale the moment the model
+                catalog changed. */}
+            <button type="button" className="chip" onClick={() => void launchRun("plan")}>
               Plan
             </button>
-            <button
-              type="button"
-              className="chip"
-              onClick={() => void launchRun("implement", "claude", "claude-3-5-sonnet-latest")}
-            >
+            <button type="button" className="chip" onClick={() => void launchRun("implement")}>
               Implement
             </button>
-            <button
-              type="button"
-              className="chip"
-              onClick={() => void launchRun("review", "claude", "claude-3-5-sonnet-latest")}
-            >
+            <button type="button" className="chip" onClick={() => void launchRun("verify")}>
+              Verify
+            </button>
+            <button type="button" className="chip" onClick={() => void launchRun("review")}>
               Review
             </button>
           </div>
@@ -705,9 +710,11 @@ export function TaskView({ task, project, projectInfo, onSave, onStatusChange }:
             );
           } else if (item.type === "run") {
             const r = item.data as TaskRun;
-            const matchedQueueRun = queueRuns.find(
-              (q) => q.phase === r.phase && q.started_at === r.started_at
-            );
+            // task_runs.run_num is forced to equal the runtime runs.id (queue.ts
+            // passes { num: run.id } to addRunOutcome), so this is an exact
+            // identity match rather than a (phase, started_at) heuristic that
+            // could collide on same-millisecond starts or a null started_at.
+            const matchedQueueRun = queueRuns.find((q) => q.id === r.run_num);
             const runQuestions = matchedQueueRun
               ? questions.filter((qn) => qn.run_id === matchedQueueRun.id)
               : [];
@@ -739,10 +746,10 @@ export function TaskView({ task, project, projectInfo, onSave, onStatusChange }:
           } else {
             const q = item.data as QueueRun;
             // Only render queueRun if it's not yet completed (running/queued/cancelled/interrupted),
-            // or if it doesn't exist in taskRuns to avoid duplication
-            const existsInTaskRuns = taskRuns.some(
-              (tr) => tr.phase === q.phase && tr.started_at === q.started_at,
-            );
+            // or if it doesn't exist in taskRuns to avoid duplication. Matched by
+            // identity (run_num === runs.id) rather than (phase, started_at) —
+            // see the "run" branch above.
+            const existsInTaskRuns = taskRuns.some((tr) => tr.run_num === q.id);
             if (existsInTaskRuns && q.status !== "running" && q.status !== "queued") {
               return null;
             }

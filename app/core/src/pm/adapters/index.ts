@@ -5,7 +5,23 @@ export interface Model {
   readonly name: string;
 }
 
-export type RunEvent = Record<string, any>;
+/**
+ * A parsed line of `--output-format stream-json` output. Every provider CLI
+ * emits its own event shapes; only the fields adapters actually read are
+ * typed, with an index signature for the rest so unknown event shapes still
+ * parse.
+ */
+export interface RunEvent {
+  readonly type: string;
+  readonly subtype?: string;
+  readonly result?: string;
+  readonly total_cost_usd?: number;
+  readonly usage?: {
+    readonly input_tokens?: number;
+    readonly output_tokens?: number;
+  };
+  readonly [key: string]: unknown;
+}
 
 export interface ProviderAdapter {
   containerCmd(opts: { prompt: string; model: string }): string[];

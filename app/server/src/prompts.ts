@@ -12,6 +12,32 @@ export interface DiffCapableClient {
   call(verb: "diff", args: { branch: string; base?: string }): Promise<DiffResult>;
 }
 
+/**
+ * Wraps a block of interpolated content in a labeled tag so the boundary
+ * between "prompt structure written by pm" and "content that arrived
+ * through .pm/ writes" is visible in the rendered prompt, even when the
+ * content itself contains text that looks like instructions.
+ *
+ * This is a hygiene measure, not a security boundary — see the trust-model
+ * note on composePrompt below.
+ */
+function delimit(tag: string, content: string): string {
+  return `<${tag}>\n${content}\n</${tag}>`;
+}
+
+/**
+ * TRUST MODEL: task descriptions, comments, specs, ADRs, and prior
+ * findings/diffs are all interpolated into this prompt, and implement runs
+ * execute with `--dangerously-skip-permissions` and the repo's deploy key
+ * mounted. Delimiting below marks the boundary clearly but does not stop a
+ * sufficiently motivated prompt injection embedded in any of that content
+ * from steering the agent — anything that can write to `.pm/` (a task
+ * description, a comment, a spec) can therefore influence an agent that
+ * holds push rights. This is accepted as inherent to pm's current trust
+ * model (a single operator's own repo, not a multi-tenant service) rather
+ * than something this function can fix by itself; it is not re-architected
+ * here.
+ */
 export async function composePrompt(opts: {
   phase: string;
   task: TaskRecord;
@@ -70,7 +96,7 @@ export async function composePrompt(opts: {
     )
     .get(projectId, task.id) as { outcome: string } | undefined;
 
-  let findingsList: string[] = [];
+  const findingsList: string[] = [];
   if (lastFailedVerify && lastFailedVerify.outcome) {
     findingsList.push(`--- Verify Findings (Failed) ---\n${lastFailedVerify.outcome}`);
   }
@@ -94,8 +120,8 @@ export async function composePrompt(opts: {
         } else {
           diff = result.diff.trim() || "No changes.";
         }
-      } catch (err: any) {
-        diff = `Could not generate git diff: ${err.message}`;
+      } catch (err) {
+        diff = `Could not generate git diff: ${err instanceof Error ? err.message : String(err)}`;
       }
     }
   }
@@ -120,16 +146,18 @@ export async function composePrompt(opts: {
     specsAndAdrs = "No specs or ADRs available.";
   }
 
-  // 3. Substitute values
+  // 3. Substitute values. Every one of these except taskNum/taskTitle is
+  // content that arrived through .pm/ writes (task descriptions, comments,
+  // specs, ADRs, prior agent output) — see the TRUST MODEL note above.
   let composed = template
     .replace(/\{\{taskNum\}\}/g, String(task.id))
     .replace(/\{\{taskTitle\}\}/g, task.title)
-    .replace(/\{\{description\}\}/g, description)
-    .replace(/\{\{questionsAndAnswers\}\}/g, questionsAndAnswers)
-    .replace(/\{\{plan\}\}/g, plan)
-    .replace(/\{\{findings\}\}/g, findings)
-    .replace(/\{\{diff\}\}/g, diff)
-    .replace(/\{\{specsAndAdrs\}\}/g, specsAndAdrs);
+    .replace(/\{\{description\}\}/g, delimit("task-description", description))
+    .replace(/\{\{questionsAndAnswers\}\}/g, delimit("clarifying-qa", questionsAndAnswers))
+    .replace(/\{\{plan\}\}/g, delimit("implementation-plan", plan))
+    .replace(/\{\{findings\}\}/g, delimit("prior-findings", findings))
+    .replace(/\{\{diff\}\}/g, delimit("code-diff", diff))
+    .replace(/\{\{specsAndAdrs\}\}/g, delimit("specs-and-adrs", specsAndAdrs));
 
   // 4. "do not modify files" guard for non-implement phases
   if (phase !== "implement") {

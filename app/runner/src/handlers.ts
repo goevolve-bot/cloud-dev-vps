@@ -2,6 +2,8 @@ import { childProcess } from "./exec.js";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import { appendFile, mkdir, readFile, readdir, stat, writeFile, rm } from "node:fs/promises";
+import type { ChildProcess } from "node:child_process";
+import type { ExecFileOptions } from "node:child_process";
 import os from "node:os";
 import { join } from "node:path";
 import { parse, stringify } from "yaml";
@@ -16,7 +18,13 @@ import {
   type TaskRecord,
 } from "@pm/core";
 
-const execFileAsync = (file: string, args: string[], opts?: any) => childProcess.execFileAsync(file, args, opts);
+const execFileAsync = (file: string, args: string[], opts?: ExecFileOptions) =>
+  childProcess.execFileAsync(file, args, opts);
+
+/** Extracts a human-readable message from an unknown catch value. */
+function errMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
 
 export interface HandlerContext {
   readonly project: string;
@@ -249,10 +257,10 @@ const activeRuns = new Map<number, ActiveRun>();
  */
 class RunJob {
   cancelled = false;
-  private child: any = null;
+  private child: ChildProcess | null = null;
   private readonly teardowns: (() => Promise<void>)[] = [];
 
-  setChild(child: any): void {
+  setChild(child: ChildProcess): void {
     this.child = child;
     if (this.cancelled) this.killChild();
   }
@@ -290,24 +298,27 @@ class RunJob {
   }
 }
 
-function stripHostPorts(services: any) {
+interface ComposeService {
+  ports?: unknown[];
+  [key: string]: unknown;
+}
+
+function stripHostPorts(services: unknown): void {
   if (!services || typeof services !== "object") return;
-  for (const key of Object.keys(services)) {
-    const svc = services[key];
-    if (svc && svc.ports && Array.isArray(svc.ports)) {
-      svc.ports = svc.ports.map((p: any) => {
-        if (typeof p === "string") {
-          const parts = p.split(":");
-          return parts[parts.length - 1];
-        } else if (p && typeof p === "object") {
-          const copy = { ...p };
-          delete copy.published;
-          delete copy.host_ip;
-          return copy;
-        }
-        return p;
-      });
-    }
+  for (const svc of Object.values(services as Record<string, ComposeService>)) {
+    if (!svc || !Array.isArray(svc.ports)) continue;
+    svc.ports = svc.ports.map((p: unknown) => {
+      if (typeof p === "string") {
+        const parts = p.split(":");
+        return parts[parts.length - 1];
+      } else if (p && typeof p === "object") {
+        const copy = { ...(p as Record<string, unknown>) };
+        delete copy.published;
+        delete copy.host_ip;
+        return copy;
+      }
+      return p;
+    });
   }
 }
 
@@ -316,7 +327,7 @@ function runCommandWithLogging(
   args: string[],
   cwd: string,
   runId: number,
-  opts: { readonly onChild?: (child: any) => void; readonly env?: NodeJS.ProcessEnv } = {},
+  opts: { readonly onChild?: (child: ChildProcess) => void; readonly env?: NodeJS.ProcessEnv } = {},
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = childProcess.spawn(cmd, args, opts.env ? { cwd, env: opts.env } : { cwd });
@@ -514,7 +525,7 @@ async function collectArtifacts(opts: {
   readonly repoDir: string;
   readonly e2eContainerName: string;
   readonly hasE2E: boolean;
-  readonly task: any;
+  readonly task: TaskRecord;
   readonly runId: number;
   readonly log: (message: string) => Promise<void>;
 }): Promise<void> {
@@ -602,8 +613,8 @@ async function collectArtifacts(opts: {
           // Copy converted GIF to runs directory
           await execFileAsync("cp", [join(pmArtifactsDir, gifFile), gifDestPath]);
           await log(`[verify] Converted and saved GIF: ${gifFile}`);
-        } catch (err: any) {
-          await log(`[verify] Warning: video conversion failed: ${err.message}. Copying raw video only.`);
+        } catch (err) {
+          await log(`[verify] Warning: video conversion failed: ${errMessage(err)}. Copying raw video only.`);
         }
       } else {
         // For other files (e.g. screenshots), copy to runArtifactsDir
@@ -635,7 +646,7 @@ async function executeVerify(opts: {
   readonly taskId: number;
   readonly projectName: string;
   readonly repoDir: string;
-  readonly task: any;
+  readonly task: TaskRecord;
   readonly branchName: string;
   readonly job: RunJob;
   readonly timeoutMs: number;
@@ -644,7 +655,7 @@ async function executeVerify(opts: {
   const log = async (message: string) => {
     await logManager.appendLine(runId, message);
   };
-  const logJson = async (obj: any) => {
+  const logJson = async (obj: { type: string; subtype: string; result: string }) => {
     await logManager.appendLine(runId, JSON.stringify(obj));
   };
 
@@ -723,8 +734,8 @@ async function executeVerify(opts: {
 
     success = true;
     summary = "Verification completed successfully. All tests and checks passed.";
-  } catch (err: any) {
-    const message = job.cancelled ? "run was cancelled" : err.message;
+  } catch (err) {
+    const message = job.cancelled ? "run was cancelled" : errMessage(err);
     await log(`[verify] Verification failed: ${message}`);
     summary = `Verification failed: ${message}`;
   } finally {
@@ -734,8 +745,8 @@ async function executeVerify(opts: {
     if (env) {
       try {
         await env.down();
-      } catch (err: any) {
-        await log(`[verify] Error during docker compose down: ${err.message}`);
+      } catch (err) {
+        await log(`[verify] Error during docker compose down: ${errMessage(err)}`);
       }
     }
     try {
@@ -746,8 +757,8 @@ async function executeVerify(opts: {
 
     try {
       await rm(verifyDir, { recursive: true, force: true });
-    } catch (err: any) {
-      await log(`[verify] Error cleaning up verify workspace: ${err.message}`);
+    } catch (err) {
+      await log(`[verify] Error cleaning up verify workspace: ${errMessage(err)}`);
     }
 
     await logJson({
@@ -847,7 +858,7 @@ function spawnAgentContainer(opts: {
   return new Promise((resolve) => {
     child.on("close", (code: number | null) => resolve(code));
     child.on("error", (err: Error) => {
-      void logManager.appendLine(opts.runId, `[stderr] failed to start container: ${err.message}`);
+      void logManager.appendLine(opts.runId, `[stderr] failed to start container: ${errMessage(err)}`);
       resolve(null);
     });
   });
@@ -909,8 +920,8 @@ async function executeReview(opts: {
         await startedEnv.down();
       });
       await startComposeEnv({ env, dir: reviewDir, runId, job, log });
-    } catch (err: any) {
-      await log(`[review] Could not start the project environment: ${err.message}`);
+    } catch (err) {
+      await log(`[review] Could not start the project environment: ${errMessage(err)}`);
       if (job.cancelled) throw err;
     }
 
@@ -933,8 +944,8 @@ async function executeReview(opts: {
       prompt: opts.prompt,
       network,
     });
-  } catch (err: any) {
-    const message = job.cancelled ? "run was cancelled" : err.message;
+  } catch (err) {
+    const message = job.cancelled ? "run was cancelled" : errMessage(err);
     await log(`[review] Review run failed: ${message}`);
     exitCode = exitCode ?? 1;
   } finally {
@@ -944,14 +955,14 @@ async function executeReview(opts: {
       await log("[review] Tearing down the project environment...");
       try {
         await env.down();
-      } catch (err: any) {
-        await log(`[review] Error during docker compose down: ${err.message}`);
+      } catch (err) {
+        await log(`[review] Error during docker compose down: ${errMessage(err)}`);
       }
     }
     try {
       await rm(reviewDir, { recursive: true, force: true });
-    } catch (err: any) {
-      await log(`[review] Error cleaning up review workspace: ${err.message}`);
+    } catch (err) {
+      await log(`[review] Error cleaning up review workspace: ${errMessage(err)}`);
     }
 
     activeRuns.delete(runId);
@@ -1215,9 +1226,9 @@ export const handlers: { [V in RunnerVerb]: Handler<V> } = {
         await runGit(["commit", "-m", message || "pm: update metadata"], repoDir);
         await runGit(["push", "origin", "HEAD"], repoDir);
         return { branch: "", pushed: true, committed: true };
-      } catch (err: any) {
+      } catch (err) {
         console.error("commitAndPush default branch error:", err);
-        return { branch: "", pushed: false, committed: false, error: err.message };
+        return { branch: "", pushed: false, committed: false, error: errMessage(err) };
       }
     }
 
@@ -1243,12 +1254,12 @@ export const handlers: { [V in RunnerVerb]: Handler<V> } = {
       // no-op, and the branch may simply already be up to date on the remote.
       await runGit(["push", "origin", branch], workspaceDir);
       return { branch, pushed: true, committed };
-    } catch (err: any) {
+    } catch (err) {
       // A rejected push (the remote moved on) leaves the work committed
       // locally in the worktree; pm surfaces the error and the next run picks
       // the branch back up.
       console.error(`commitAndPush branch ${branch} error:`, err);
-      return { branch, pushed: false, committed, error: err.message };
+      return { branch, pushed: false, committed, error: errMessage(err) };
     }
   },
 
@@ -1310,8 +1321,8 @@ export const handlers: { [V in RunnerVerb]: Handler<V> } = {
           }
         }
         removed.push(project);
-      } catch (err: any) {
-        console.error(`sweepVerifyEnvs: could not remove ${project}:`, err.message);
+      } catch (err) {
+        console.error(`sweepVerifyEnvs: could not remove ${project}:`, errMessage(err));
       }
     }
     return { removed };
