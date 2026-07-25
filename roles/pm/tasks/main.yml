@@ -26,7 +26,7 @@
       - pm_auth_password != 'changeme'
     fail_msg: >-
       pm_auth_password is unset (or still the old 'changeme' placeholder).
-      Set it in group_vars/all.yml as a vault-encrypted string:
+      Set it in group_vars/all/vault.yml as a vault-encrypted string:
       ansible-vault encrypt_string 'yourpassword' --name pm_auth_password
 
 - name: T39 — pm base (user, docker, dirs, sysctl, compose stack)

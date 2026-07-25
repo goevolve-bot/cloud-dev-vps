@@ -1,0 +1,8 @@
+---
+dev_user: debian
+github_username: titarenko
+git_user_name: Constantin Titarenko
+git_user_email: i.const.t@gmail.com
+
+# pm_auth_password lives in group_vars/all/vault.yml (vault-encrypted).
+pm_auth_user: pm
