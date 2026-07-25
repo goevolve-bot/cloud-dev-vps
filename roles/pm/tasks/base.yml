@@ -117,6 +117,14 @@
     # gets its own mode in nginx_tls.yml.
     mode: "0755"
 
+# --chown is not optional. `synchronize` runs rsync in archive mode, and -a
+# preserves *numeric* uid/gid from the control node: every file — and the
+# destination directory itself — lands owned by whatever uid ran ansible, not
+# by pm. The next task in this role builds @pm/runner as the pm user, and pnpm
+# writes its temp files into the workspace root, so it died with EACCES on
+# /srv/pm/app before it read a single package. Fixing it here rather than with
+# a recursive chown afterwards keeps the walk off node_modules, which rsync
+# excludes but pnpm then populates with tens of thousands of files.
 - name: Synchronise app/ source to {{ pm_app_dest }}
   synchronize:
     src: "{{ pm_app_src }}/"
@@ -125,8 +133,21 @@
       - "--exclude=node_modules"
       - "--exclude=.git"
       - "--exclude=*/dist"
+      - "--chown={{ pm_user }}:{{ pm_group }}"
     delete: false
   notify: restart pm compose
+
+# rsync also carries the source directory's mode across, which is whatever the
+# control node's checkout happens to be (0775 here). Re-assert the mode the
+# permission model depends on: project users are not in the pm group and reach
+# the runner tree through the world-execute bit alone.
+- name: Re-assert mode on {{ pm_app_dest }} after sync
+  file:
+    path: "{{ pm_app_dest }}"
+    state: directory
+    owner: "{{ pm_user }}"
+    group: "{{ pm_group }}"
+    mode: "0755"
 
 # ── 7. Enable linger so pm user services survive without a login session ──
 

@@ -231,6 +231,24 @@ test("pm assigns the run id, and the runner uses it for the log file and contain
   assert.equal(dockerRun.args[dockerRun.args.indexOf("--name") + 1], "pm-agent-run-77");
 });
 
+test("the credential shim picks the env var Claude Code actually reads", async () => {
+  await startRun({ runId: 78, taskId: 1 });
+  await call({ id: "wait-78", verb: "streamLogs", args: { runId: 78 } });
+
+  const dockerRun = spawnCalls.find((c) => c.file === "docker" && c.args[0] === "run");
+  assert.ok(dockerRun);
+  const shim = dockerRun.args[dockerRun.args.indexOf("-c") + 1];
+
+  // An OAuth token (`claude setup-token`) authenticates only through
+  // CLAUDE_CODE_OAUTH_TOKEN; exported as ANTHROPIC_API_KEY it 401s on every
+  // call. A console key is the other way round. One credential slot, so the
+  // shim has to branch on the value at container start.
+  assert.match(shim, /sk-ant-oat\*\) CLAUDE_CODE_OAUTH_TOKEN=/);
+  assert.match(shim, /\*\) ANTHROPIC_API_KEY=/);
+  // The value is only ever read inside the container, never placed on argv.
+  assert.ok(!shim.includes("sk-ant-api"));
+});
+
 test("startRun rejects a request without a pm-assigned run id", async () => {
   const messages = await call({
     id: "no-run-id",

@@ -1,0 +1,101 @@
+---
+# --------------------------------------------------------------------------
+# roles/pm — the agent image
+#
+# @pm/runner runs every implement/plan/review container as
+# `docker run ... pm-agent ...` (agentDockerArgs in runner/src/handlers.ts).
+# app/agent-image/Dockerfile has been in the tree since T-whatever, but
+# *nothing built it* — not compose, not this role, not pm-projectctl. Every run
+# would have died on "Unable to find image 'pm-agent:latest' locally" followed
+# by a Docker Hub 404.
+#
+# It also has to exist in the right daemon. Each project user runs its own
+# rootless dockerd with its own image store, so building it once into the pm
+# user's daemon is not enough. Build once here, export, and let
+# pm-projectctl `docker load` it per project (ensure_agent_image).
+#
+# Runs after base.yml: it needs both the synced Dockerfile at
+# {{ pm_app_dest }}/agent-image and the pm user's rootless daemon.
+# --------------------------------------------------------------------------
+
+- name: Create the agent image export directory
+  file:
+    path: "{{ pm_agent_image_dir }}"
+    state: directory
+    owner: "{{ pm_user }}"
+    group: "{{ pm_group }}"
+    # World-readable: project users are not in the pm group and have to read
+    # the exported tar to load it into their own daemon. It is a build
+    # artifact of a public Dockerfile — it carries no secrets.
+    mode: "0755"
+
+- name: Build the {{ pm_agent_image_tag }} image
+  become: true
+  become_user: "{{ pm_user }}"
+  command:
+    cmd: >
+      /home/{{ pm_user }}/bin/docker build
+      --tag {{ pm_agent_image_tag }}
+      {{ pm_app_dest }}/agent-image
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ pm_user_uid }}"
+    DOCKER_HOST: "unix:///run/user/{{ pm_user_uid }}/docker.sock"
+    HOME: "/home/{{ pm_user }}"
+    PATH: "/home/{{ pm_user }}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  register: pm_agent_build
+  # BuildKit writes its step log to stderr and marks reused layers CACHED.
+  changed_when: "'CACHED' not in pm_agent_build.stderr"
+
+- name: Read the built agent image ID
+  become: true
+  become_user: "{{ pm_user }}"
+  command: "/home/{{ pm_user }}/bin/docker image inspect --format {{ '{{.Id}}' }} {{ pm_agent_image_tag }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ pm_user_uid }}"
+    DOCKER_HOST: "unix:///run/user/{{ pm_user_uid }}/docker.sock"
+    HOME: "/home/{{ pm_user }}"
+  register: pm_agent_image_id
+  changed_when: false
+
+- name: Read the currently exported agent image ID
+  slurp:
+    src: "{{ pm_agent_image_dir }}/pm-agent.id"
+  register: pm_agent_exported_id
+  failed_when: false
+
+# `docker save` of this image is ~1 GB and takes a while, so it is skipped
+# whenever the tar on disk already holds the image that was just built. The id
+# file beside it is the record of what that is — pm-projectctl compares the
+# same value against the project daemon's copy to decide whether to load.
+- name: Export the agent image for pm-projectctl
+  become: true
+  become_user: "{{ pm_user }}"
+  command:
+    cmd: >
+      /home/{{ pm_user }}/bin/docker save
+      --output {{ pm_agent_image_dir }}/pm-agent.tar
+      {{ pm_agent_image_tag }}
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ pm_user_uid }}"
+    DOCKER_HOST: "unix:///run/user/{{ pm_user_uid }}/docker.sock"
+    HOME: "/home/{{ pm_user }}"
+  when: >-
+    pm_agent_exported_id.content is not defined
+    or (pm_agent_exported_id.content | b64decode | trim) != pm_agent_image_id.stdout | trim
+
+- name: Make the exported agent image readable by project users
+  file:
+    path: "{{ pm_agent_image_dir }}/pm-agent.tar"
+    owner: "{{ pm_user }}"
+    group: "{{ pm_group }}"
+    mode: "0644"
+
+# Written last: if the save above failed, the id file still names the previous
+# export and pm-projectctl keeps loading something that exists.
+- name: Record the exported agent image ID
+  copy:
+    content: "{{ pm_agent_image_id.stdout | trim }}\n"
+    dest: "{{ pm_agent_image_dir }}/pm-agent.id"
+    owner: "{{ pm_user }}"
+    group: "{{ pm_group }}"
+    mode: "0644"

@@ -64,29 +64,73 @@ function defaultRunTimeoutMs(): number {
 }
 
 /**
- * Credential file (written by pm-projectctl set-credential) → the environment
- * variable the agent CLI reads. The file names come from
- * PROVIDER_CREDENTIAL_KEYS in server/src/app.ts; adding a provider means
- * adding it in both places.
+ * How each credential file (written by pm-projectctl set-credential) reaches
+ * the CLI that needs it. File names come from PROVIDER_CREDENTIAL_KEYS in
+ * server/src/app.ts; adding a provider means adding it in both places.
  *
- * TODO: ANTIGRAVITY_API_KEY is unverified — nobody has run `agy --help` on a
- * host yet (see docs/pm-remediation/README.md).
+ * The two providers genuinely differ, and both were wrong before this:
+ *
+ * `anthropic` — Anthropic issues two kinds of credential and the Claude CLI
+ * reads each from a *different* variable: a console API key (`sk-ant-api…`)
+ * from ANTHROPIC_API_KEY, and a Claude Code OAuth token (`sk-ant-oat…`, what
+ * `claude setup-token` mints) from CLAUDE_CODE_OAUTH_TOKEN. Exporting an OAuth
+ * token as ANTHROPIC_API_KEY does not fail loudly — the CLI treats it as an
+ * API key and every run dies on a 401. The UI has one credential slot per
+ * provider by design, so the shim picks the variable from the token's own
+ * prefix rather than asking which kind was pasted.
+ *
+ * `antigravity` — there is no ANTIGRAVITY_API_KEY. `agy --help` and `strings`
+ * on the binary confirm it: the CLI authenticates from a JSON token document
+ * at ~/.gemini/antigravity-cli/antigravity-oauth-token, which `agy` writes
+ * itself during an interactive Google login. So the credential is delivered as
+ * that file, and the value the UI stores has to be the file's contents.
  */
-const CREDENTIAL_ENV: Record<string, string> = {
-  anthropic: "ANTHROPIC_API_KEY",
-  antigravity: "ANTIGRAVITY_API_KEY",
+type CredentialDelivery =
+  | { readonly kind: "env"; readonly name: string }
+  | { readonly kind: "env-by-prefix"; readonly match: string; readonly then: string; readonly else: string }
+  | { readonly kind: "file"; readonly path: string };
+
+const CREDENTIAL_DELIVERY: Record<string, CredentialDelivery> = {
+  anthropic: {
+    kind: "env-by-prefix",
+    match: "sk-ant-oat*",
+    then: "CLAUDE_CODE_OAUTH_TOKEN",
+    else: "ANTHROPIC_API_KEY",
+  },
+  antigravity: {
+    kind: "file",
+    path: "/root/.gemini/antigravity-cli/antigravity-oauth-token",
+  },
 };
 
 /**
- * A `sh -c` preamble that loads the mounted credentials into the environment
- * and then `exec`s the real command. The value is read inside the container,
- * so it never appears in any argv the host can see.
+ * A `sh -c` preamble that delivers the mounted credentials and then `exec`s
+ * the real command. Values are read inside the container, so they never appear
+ * in any argv the host can see — which is also why the prefix test below is a
+ * shell `case` and not a decision made out here.
  */
 function credentialShim(): string {
-  const lines = Object.entries(CREDENTIAL_ENV).map(
-    ([file, env]) =>
-      `if [ -r ${CREDS_MOUNT}/${file} ]; then ${env}="$(cat ${CREDS_MOUNT}/${file})"; export ${env}; fi`,
-  );
+  const lines = Object.entries(CREDENTIAL_DELIVERY).map(([file, spec]) => {
+    const src = `${CREDS_MOUNT}/${file}`;
+    let body: string;
+    switch (spec.kind) {
+      case "env":
+        body = `${spec.name}="$(cat ${src})"; export ${spec.name};`;
+        break;
+      case "env-by-prefix":
+        body =
+          `__pm_cred="$(cat ${src})"; ` +
+          `case "$__pm_cred" in ${spec.match}) ${spec.then}="$__pm_cred"; export ${spec.then} ;; ` +
+          `*) ${spec.else}="$__pm_cred"; export ${spec.else} ;; esac; unset __pm_cred;`;
+        break;
+      case "file":
+        // The mount is read-only, so the token is copied rather than linked —
+        // agy rewrites this file when it refreshes the access token.
+        body = `mkdir -p "$(dirname ${spec.path})"; cp ${src} ${spec.path}; chmod 600 ${spec.path};`;
+        break;
+    }
+    return `if [ -r ${src} ]; then ${body} fi`;
+  });
   return [...lines, 'exec "$@"'].join("\n");
 }
 

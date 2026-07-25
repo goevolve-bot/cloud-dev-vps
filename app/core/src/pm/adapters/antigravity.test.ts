@@ -3,7 +3,10 @@ import { test } from "node:test";
 import { Readable } from "node:stream";
 import { AntigravityAdapter } from "./antigravity.js";
 
-test("AntigravityAdapter parses stream-json and extracts outcome and cost", async () => {
+// agy --print emits plain text today, so parseEvents yields nothing on a real
+// run. This covers the forward-compatible path: if agy ever grows structured
+// output in the shape the rest of the pipeline already speaks, it works.
+test("AntigravityAdapter extracts outcome and cost from structured output if it appears", async () => {
   const adapter = new AntigravityAdapter();
   const recordedStream = [
     JSON.stringify({ type: "system", message: "Starting agy..." }),
@@ -42,12 +45,30 @@ test("AntigravityAdapter parses stream-json and extracts outcome and cost", asyn
   });
 });
 
-test("AntigravityAdapter containerCmd uses agy with dangerously-skip-permissions", () => {
+test("AntigravityAdapter containerCmd uses only flags agy actually accepts", () => {
   const adapter = new AntigravityAdapter();
-  const cmd = adapter.containerCmd({ prompt: "do the thing", model: "gemini-2.5-pro" });
-  assert.equal(cmd[0], "agy");
-  assert.ok(cmd.includes("--dangerously-skip-permissions"));
-  assert.ok(cmd.includes("--output-format"));
-  assert.ok(cmd.includes("stream-json"));
-  assert.ok(cmd.includes("gemini-2.5-pro"));
+  const cmd = adapter.containerCmd({ prompt: "do the thing", model: "gemini-3.1-pro-high" });
+  assert.deepEqual(cmd, [
+    "agy",
+    "--print",
+    "do the thing",
+    "--model",
+    "gemini-3.1-pro-high",
+    "--dangerously-skip-permissions",
+  ]);
+  // Claude Code's flags, which this adapter used to copy. `agy --help` lists
+  // neither, and agy rejects unknown flags before generating a single token.
+  assert.ok(!cmd.includes("--output-format"));
+  assert.ok(!cmd.includes("--verbose"));
+});
+
+test("AntigravityAdapter advertises model ids the CLI recognises", async () => {
+  const adapter = new AntigravityAdapter();
+  const ids = (await adapter.models()).map((m) => m.id);
+  // Verified against `agy models` on the host, 2026-07-25.
+  assert.ok(ids.includes("gemini-3.1-pro-high"));
+  assert.ok(ids.includes("claude-sonnet-4-6"));
+  // The ids this used to advertise are not in agy's list at all.
+  assert.ok(!ids.includes("gemini-2.5-pro"));
+  assert.ok(!ids.includes("claude-sonnet-5"));
 });

@@ -211,6 +211,62 @@ class RunnerUnitTests(unittest.TestCase):
         self.assertIn("Requires=docker.service", unit)
 
 
+class AgentImageTests(unittest.TestCase):
+    """`docker run pm-agent` is every run's first act, and image stores are
+    per-daemon. These cover the load decision, not the load itself."""
+
+    def _cfg_with_export(self, *, tar: bool, image_id: str = "sha256:aaa") -> "ctl.Config":
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+        values = dict(ctl.DEFAULT_CONFIG)
+        values["agent_image_tar"] = os.path.join(tmp, "pm-agent.tar")
+        values["agent_image_id_file"] = os.path.join(tmp, "pm-agent.id")
+        if tar:
+            Path(values["agent_image_tar"]).write_bytes(b"not really a tar")
+            Path(values["agent_image_id_file"]).write_text(image_id + "\n")
+        return ctl.Config(values)
+
+    def test_missing_export_fails_create_rather_than_the_first_run(self):
+        cfg = self._cfg_with_export(tar=False)
+        with self.assertRaises(ctl.PmError) as caught:
+            ctl.ensure_agent_image(cfg, fake_passwd())
+        self.assertEqual(caught.exception.code, "agent_image_missing")
+
+    def test_skips_the_load_when_the_daemon_already_has_that_image(self):
+        cfg = self._cfg_with_export(tar=True, image_id="sha256:aaa")
+        with mock.patch.object(ctl, "run") as run:
+            run.return_value = mock.Mock(stdout="sha256:aaa\n")
+            result = ctl.ensure_agent_image(cfg, fake_passwd())
+        self.assertFalse(result["loaded"])
+        self.assertEqual(run.call_count, 1)  # the inspect, and no load
+
+    def test_loads_when_the_daemon_has_a_different_image(self):
+        cfg = self._cfg_with_export(tar=True, image_id="sha256:new")
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            loaded = any(call[:2] == ["docker", "load"] for call in calls)
+            calls.append(list(argv))
+            # inspect before the load reports the stale image, after it the new one.
+            if argv[:3] == ["docker", "image", "inspect"]:
+                return mock.Mock(stdout="sha256:new\n" if loaded else "sha256:old\n")
+            return mock.Mock(stdout="")
+
+        with mock.patch.object(ctl, "run", side_effect=fake_run):
+            result = ctl.ensure_agent_image(cfg, fake_passwd())
+        self.assertTrue(result["loaded"])
+        self.assertEqual(result["id"], "sha256:new")
+        self.assertIn(["docker", "load", "--input", cfg.agent_image_tar], calls)
+
+    def test_load_that_produces_no_image_is_an_error(self):
+        cfg = self._cfg_with_export(tar=True, image_id="sha256:new")
+        with mock.patch.object(ctl, "run") as run:
+            run.return_value = mock.Mock(stdout="")
+            with self.assertRaises(ctl.PmError) as caught:
+                ctl.ensure_agent_image(cfg, fake_passwd())
+        self.assertEqual(caught.exception.code, "agent_image_missing")
+
+
 class ConfigTests(unittest.TestCase):
     def test_defaults_when_file_is_absent(self):
         cfg = ctl.load_config("/nonexistent/pm-projectctl.conf")

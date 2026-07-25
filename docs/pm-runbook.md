@@ -1,189 +1,341 @@
 # PM System — Deployment Runbook
 
-> **T43 deliverable** — documents the green path from a bare VPS to a running
-> PM stack with a real project, an implement run, and verified artifacts.
+> Rewritten 2026-07-25 from an actual deployment onto a bare VPS
+> (Debian 13 trixie, 2 vCPU / 4 GB / 38 GB). Everything below was executed; the
+> "What is still unproven" section at the end says plainly what was not.
+>
+> The previous version of this file described a green path that had never been
+> walked — it told you to click buttons that did not exist. Six playbook runs
+> were needed to get from a bare host to a passing verify. What broke, and why,
+> is recorded in §7 rather than quietly fixed, because every one of those
+> failures is a thing a future deploy can hit again.
 
 ---
 
-## Prerequisites
+## 1. Prerequisites
 
 | Requirement | Notes |
 |-------------|-------|
-| Ansible ≥ 2.14 on the control node | `pip install ansible` |
-| VPS running Debian 12 (Bookworm) | Root or sudo-capable SSH key |
-| Domain pointing at the VPS, proxied through Cloudflare | Full (strict) TLS mode |
-| A git repository you want to manage | Public or accessible with deploy key |
+| Ansible ≥ 2.14 on the control node | `uv tool install --with ansible ansible-core` — installing the `ansible` bundle alone gives you an `ansible-community` binary and no `ansible-playbook` |
+| `rsync` on control node **and** target | `roles/pm` deploys the app tree with `synchronize` |
+| VPS running Debian 12 or 13 | Root SSH key access. Verified on 13 (trixie) |
+| A git repository to manage | Must accept a deploy key with **write** access |
+| A provider credential | Claude Code OAuth token (`claude setup-token`) or an Anthropic console API key. Needed only for agent phases — see §6 |
+| Domain proxied through Cloudflare | Optional but assumed by the firewall — see §3 |
 
 ---
 
-## 1. Initial provisioning
+## 2. Initial provisioning
 
-### 1.1 Clone the ops repo
+### 2.1 Clone the ops repo
 
 ```bash
 git clone git@github.com:titarenko/cloud-dev-vps.git
 cd cloud-dev-vps
 ```
 
-### 1.2 Set the vault password
+### 2.2 Set the web password
 
-The `pm_auth_password` in `group_vars/all.yml` must be replaced with a
-vault-encrypted value before running against production:
+`pm_auth_password` has no default anywhere in the repo and `roles/pm` asserts it
+is set, so the play fails loudly rather than deploying a password that lives in
+git history.
 
 ```bash
-# Create a vault password file (keep it out of the repo)
 echo 'your-vault-password' > ~/.pm-vault-pass
 chmod 600 ~/.pm-vault-pass
 
-# Encrypt the web-UI password
 ansible-vault encrypt_string 'your-web-password' \
   --name pm_auth_password \
   --vault-password-file ~/.pm-vault-pass
 ```
 
-Paste the output into `group_vars/all.yml`, replacing the plaintext stub.
+Paste the output into `group_vars/all.yml` beneath `pm_auth_user`.
 
-### 1.3 Set your inventory
-
-`inventory.ini` should contain the VPS hostname/IP:
+### 2.3 Set your inventory
 
 ```ini
 [vps]
-your-vps-hostname-or-ip
+your-vps-ip-or-hostname
 ```
 
-### 1.4 Run the playbook
+### 2.4 Run the playbook
 
 ```bash
 ansible-playbook playbook.yml \
   --vault-password-file ~/.pm-vault-pass \
-  -u root          # or your sudo user with -K
+  -u root
 ```
 
-Expected output (abridged):
+Roughly 3.5 minutes on a cold host, most of it the `apt full-upgrade`, the
+`pm-agent` image build, and the pm server image build. Expected:
 
 ```
 PLAY RECAP ******************************************************************
-your-vps : ok=54  changed=18  unreachable=0  failed=0
+your-vps : ok=119  changed=14  unreachable=0  failed=0
 ```
 
-**Done criteria (T39–T42):**
+### 2.5 Confirm the stack is actually up
 
-- `systemctl --user -M pm@ status pm-compose.service` → `active (running)`
-- `curl -sk -u pm:<password> https://localhost:443/` → HTTP 200 or the PM UI
-- `nft list ruleset` → shows `tcp dport 443` accept rule for Cloudflare ranges
-- `systemctl status pm-projectctl.socket` → `active (listening)`
-
----
-
-## 2. Cloudflare configuration
-
-1. In the Cloudflare dashboard, set SSL/TLS mode to **Full (strict)**.
-2. Point your domain's A/AAAA record at the VPS.  Proxy must be **enabled** (orange cloud).
-3. Verify the origin cert: `openssl s_client -connect your-domain:443 -servername your-domain`
-
-> The nftables ruleset (T42) only accepts :443 connections from Cloudflare
-> IP ranges.  Direct connections to the origin IP will be dropped.  If you
-> need temporary direct access for debugging, set `pm_nftables_cloudflare_only: false`
-> in `group_vars/all.yml` and re-run the playbook.
-
----
-
-## 3. Adding your first project
-
-1. Open `https://your-domain` in a browser, log in with username **pm** and
-   the password you set.
-2. Click **+ New project** in the header.
-3. Enter a project name (lowercase letters, digits, hyphens — e.g. `my-app`).
-4. Paste the HTTPS or SSH git URL of the repository.
-5. Click **Create**.  The UI will display the deploy key — add it as a
-   read/write deploy key in your git provider.
-6. The project card shows `active` once the runner socket is detected.
-
----
-
-## 4. Running implement → verify on a sample task
-
-### 4.1 Create a task
-
-1. Select the project, go to **Tasks**, click **+ New task**.
-2. Fill in a title and description.  For a smoke test, something minimal:
-   - **Title**: `Add hello endpoint`
-   - **Description**: `Add GET /hello that returns {"hello":"world"} and a corresponding test.`
-3. Click **Save**.
-
-### 4.2 Launch an implement run
-
-1. Open the task.
-2. In the launch bar, select:
-   - **Phase**: Implement
-   - **Provider**: Claude (or Antigravity if configured)
-   - **Model**: leave at the project default
-3. Click **Run**.
-4. The timeline shows the live log stream.  Watch the agent edit files and
-   commit.
-
-### 4.3 Verify runs automatically
-
-After a successful implement, verify runs automatically (T28).  The verify
-phase:
-
-1. Checks out the task branch into a fresh Docker volume.
-2. Runs `docker compose up --build --wait` on the project's compose stack.
-3. Executes the `test` and (if present) `e2e` services.
-4. Collects artifacts from the `./pm-artifacts` directory.
-
-The timeline shows a **pass** or **fail** chip.  Screenshots and GIFs (if any)
-appear in the artifacts gallery below the timeline.
-
-### 4.4 Merge the branch
-
-Once the task is accepted (click **Accept** on the review findings or the task
-passes verify automatically):
-
-- The task moves to `done`.
-- The branch is available on `origin` — create a pull request or merge
-  manually from the repository.
-
----
-
-## 5. Updating the stack
-
-To deploy a new version of the PM app:
+`failed=0` is not sufficient — the stack can deploy cleanly and crash-loop (it
+did; §7.5). Check the containers, not just the play:
 
 ```bash
-# On the control node
-git pull
-ansible-playbook playbook.yml \
-  --vault-password-file ~/.pm-vault-pass \
-  --tags pm          # only run the pm role
+ssh root@your-vps
+runuser -u pm -- env XDG_RUNTIME_DIR=/run/user/$(id -u pm) \
+  DOCKER_HOST=unix:///run/user/$(id -u pm)/docker.sock \
+  /home/pm/bin/docker ps
 ```
 
-The `synchronize` task in `roles/pm/tasks/base.yml` copies the updated source,
-rebuilds images, and triggers a `pm-compose.service` restart via the handler.
+Both `pm-pm-1` and `pm-nginx-1` must read `Up`. `Restarting` means the server is
+crash-looping — get the reason with `docker logs pm-pm-1`.
+
+Then, from the host itself (the firewall blocks :443 from anywhere but
+Cloudflare, but `iif lo accept` comes first, so loopback works):
+
+```bash
+curl -sk -o /dev/null -w '%{http_code}\n' https://127.0.0.1/            # 401
+curl -sk -u pm:PASSWORD -o /dev/null -w '%{http_code}\n' https://127.0.0.1/  # 200
+curl -sk -u pm:PASSWORD https://127.0.0.1/api/projects                  # {"projects":[]}
+systemctl is-active pm-projectctl.socket                                # active
+systemctl --machine pm@.host --user is-active pm-compose.service        # active
+nft list ruleset | grep 'dport 443'                                     # cloudflare4/6 rules
+```
 
 ---
 
-## 6. Troubleshooting
+## 3. Cloudflare configuration
+
+1. Set SSL/TLS mode to **Full (strict)**.
+2. Point the domain's A/AAAA record at the VPS with the proxy **enabled**.
+3. The origin serves a self-signed cert; Cloudflare presents the real one.
+
+> `roles/nftables` accepts :443 **only** from Cloudflare's published ranges, so
+> until DNS exists the UI is reachable only over loopback on the host. For
+> temporary direct access set `pm_nftables_cloudflare_only: false` in
+> `group_vars/all.yml` and re-run. Remember to set it back.
+
+---
+
+## 4. Adding a project
+
+The repository must satisfy the project contract before verify can do anything
+useful: a `Dockerfile` at the root, and a `compose.yaml` with a service that
+publishes ports **and** declares a `healthcheck`, plus one-shot `test` and
+(optionally) `e2e` services. `app/../docs/pm-system-plan.md` has the full rules;
+`contract.isCompliant` in the API response tells you whether it passed.
+
+1. Open the UI, log in as **pm**.
+2. **+ New project** → name (`[a-z0-9-]`, max 29 chars) and the SSH git URL.
+3. Creation stops at `awaiting-key` and shows a public key. **This is expected,
+   not a failure.** Add it to the repository as a deploy key **with write
+   access** — the runner pushes branches.
+4. Click Create again with the same name and URL. The second call resumes: it
+   clones, loads the agent image into the project's own Docker daemon,
+   scaffolds `.pm/`, and installs the runner unit.
+5. The project reads `connected` once its runner socket appears.
+
+The equivalent over the API, which is what was actually used to validate this:
+
+```bash
+curl -sk -N -u pm:PASSWORD -H 'Content-Type: application/json' \
+  -d '{"name":"smoke","gitUrl":"git@github.com:you/your-repo.git"}' \
+  https://127.0.0.1/api/projects
+```
+
+It is a Server-Sent Events stream; each provisioning step arrives as its own
+`data:` line, ending in `awaiting-key` or `ready`.
+
+---
+
+## 5. Running a task
+
+### 5.1 Create the task
+
+```bash
+curl -sk -u pm:PASSWORD -H 'Content-Type: application/json' \
+  -d '{"title":"Add a version endpoint","description":"..."}' \
+  https://127.0.0.1/api/projects/smoke/tasks
+```
+
+The response carries `"pushed":true` when the `.pm/` tree reached `origin` — the
+task board is versioned with the code, so a task is a commit.
+
+### 5.2 Implement, then verify
+
+Launch an implement run from the task view (phase, provider, model). The agent
+commits in its worktree and the runner pushes `pm/task-<id>-<slug>`; verify is
+queued automatically on success.
+
+Verify then, in the project user's own rootless daemon:
+
+1. Clones the **pushed branch from origin** — not the local worktree, so it
+   checks what was actually delivered.
+2. Rewrites the compose file without host port bindings and brings up only the
+   long-running services with `--wait`. Naming them explicitly is what keeps
+   `--wait` from blocking forever on `test`/`e2e`, which exit immediately and
+   which Compose otherwise reports as a failed start.
+3. Runs `test`, then `e2e`.
+4. Collects `/pm-artifacts` out of the e2e container, converts videos to GIF,
+   and copies screenshots into the task's attachments.
+5. Tears the stack down with an explicit `-f` and deletes the workspace.
+
+A passing verify moves the task to `ready-for-review` on its own.
+
+Observed on the reference repo: run completes in ~30 s, `exit_code: 0`, task at
+`ready-for-review`, `{"artifacts":["e2e-result.txt"]}`, and no leftover
+containers, volumes or `verify-*` work directories.
+
+---
+
+## 6. Provider credentials
+
+Credentials are set from the UI's settings modal and delivered by
+`pm-projectctl set-credential` into `~/.pm-creds/<provider>` on the project
+user, mounted read-only into the agent container. They are never in Ansible,
+never on argv, and never in the database in plaintext.
+
+**Claude.** Paste either kind of credential; the shim picks the variable from
+the value's own prefix, because the CLI reads them from different places:
+
+| Value | Exported as |
+|---|---|
+| `sk-ant-oat…` (from `claude setup-token`) | `CLAUDE_CODE_OAUTH_TOKEN` |
+| anything else (console API key) | `ANTHROPIC_API_KEY` |
+
+Getting this wrong does not fail loudly — an OAuth token exported as
+`ANTHROPIC_API_KEY` 401s on every call.
+
+**Antigravity.** There is no API key. `agy` authenticates from a JSON OAuth
+document that it writes during an interactive Google login, so the value to
+paste is the **contents of that file**, taken from a machine where you have
+already logged in:
+
+```bash
+cat ~/.gemini/antigravity-cli/antigravity-oauth-token
+```
+
+The shim writes it to
+`/root/.gemini/antigravity-cli/antigravity-oauth-token` inside the container.
+It is copied rather than symlinked because `agy` rewrites the file when it
+refreshes the access token, and the credential mount is read-only.
+
+---
+
+## 7. What actually broke on first deploy
+
+Kept because each of these was invisible until a real host ran the code, and
+each would recur on a fresh deploy of the pre-2026-07-25 tree.
+
+**7.1 Corepack ignored the pinned pnpm.** `roles/pm` ran
+`corepack prepare pnpm@10.11.0 --activate`, but Corepack's shim always prefers
+the project's own `packageManager` field and, finding none, resolved the latest
+release and tried to *write the field back* into `/srv/pm/app/package.json`.
+That runs as `pm` against a root-synced tree, so the runner install died with
+`EACCES`. Fixed by adding `packageManager` to `app/package.json`, which also
+pins the pnpm used inside `server/Dockerfile`.
+
+**7.2 rsync shipped the wrong ownership.** `synchronize` runs rsync in archive
+mode, which preserves *numeric* uid/gid from the control node — the whole
+`/srv/pm/app` tree, and the directory itself, landed owned by the control
+node's user rather than `pm`. Fixed with `--chown` in `rsync_opts` plus a mode
+re-assert, rather than a recursive chown that would walk `node_modules`.
+
+**7.3 No Docker existed for project users.** Every Docker install in the repo
+was per-user into `~/bin`, but `pm-<name>` users are created later, by
+`pm-projectctl`, which preflights `dockerd-rootless-setuptool.sh` and then
+shells out to `docker`. Neither was on any PATH, so no project could be
+created. `roles/pm/tasks/docker_host.yml` now installs the static client,
+rootless extras, and the compose/buildx plugins system-wide — static tarballs
+rather than Docker's apt repo, because `docker-ce-rootless-extras` depends on
+`docker-ce` and would install a rootful daemon.
+
+**7.4 The agent image was never built.** `app/agent-image/Dockerfile` had been
+in the tree for milestones, but nothing built it — not compose, not Ansible,
+not projectctl — so every run would have died on
+`Unable to find image 'pm-agent:latest'`. Image stores are per-daemon, so
+building it once was not enough either. It is now built and exported once at
+deploy time (`agent_image.yml`) and `docker load`ed into each project's daemon
+at create time (`ensure_agent_image`), which also keeps a multi-minute failure
+out of the create-project modal.
+
+**7.5 The pm server crash-looped on every deploy.** `pnpm-workspace.yaml` said
+`allowBuilds:`, which is not a pnpm setting — pnpm 10 silently ignored it, so
+`better-sqlite3`'s postinstall never ran and the server died on
+`Could not locate the bindings file`. The real key is `onlyBuiltDependencies`.
+Alpine also needs a toolchain, since better-sqlite3 only publishes glibc
+prebuilds; it is added and removed inside one `RUN` so it never reaches a layer.
+
+**7.6 The Antigravity adapter was written against a CLI nobody had run.** It
+copied Claude Code's flags. `agy --help` has no `--output-format` and no
+`--verbose`, so every Antigravity run would have been rejected before
+generating a token; `agy --print` emits plain text, not stream-json; and every
+model id it advertised was wrong. Corrected against `agy --help` and
+`agy models` on the host. Because output is plain text, Antigravity runs report
+no cost and no result summary — `queue.ts` decides success from the container's
+exit code, so this costs reporting detail, not correctness.
+
+---
+
+## 8. What is still unproven
+
+Stated plainly rather than implied by omission.
+
+- **The implement, plan and review phases have not been run.** They need a
+  provider credential, which was not available when this was written. Verify
+  was validated by pushing a `pm/task-1-*` branch by hand and triggering a
+  verify run against it. Everything downstream of the agent container —
+  cloning, compose orchestration, tests, artifacts, teardown, status
+  transitions — is confirmed; the agent container itself is not.
+- **`task.branch` stays `null` on this path.** It is set when an implement run
+  creates the branch, so a hand-pushed branch leaves it unset. Not a defect,
+  but it means the branch chip in the task header is also unconfirmed.
+- **The public Cloudflare path was not exercised.** Everything was verified over
+  loopback on the host. The nftables rules and nginx real-IP config are
+  deployed and correct by inspection, but no request has traversed Cloudflare.
+- **Antigravity has not been run end to end.** The flags, model ids and
+  credential path are now taken from the real CLI, but no agy run has executed
+  inside the agent container.
+
+---
+
+## 9. Updating the stack
+
+```bash
+git pull
+ansible-playbook playbook.yml --vault-password-file ~/.pm-vault-pass -u root
+```
+
+The app sync notifies a `pm-compose.service` restart. Re-running is safe: the
+agent image is only re-exported when its id changes, and `create` on an
+existing project resumes rather than rebuilding.
+
+---
+
+## 10. Troubleshooting
 
 | Symptom | Check |
 |---------|-------|
-| `pm-compose.service` fails to start | `journalctl --user -u pm-compose -n 50 -M pm@` |
-| HTTPS returns 502 | `docker compose -p pm logs pm` (inside pm user session) |
-| Auth returns 401 | Re-run playbook to regenerate htpasswd; ensure `pm_auth_password` is set |
-| Cloudflare 521 | Check nftables: `nft list set inet filter cloudflare4` must be non-empty |
-| `pm-projectctl` hangs | `systemctl status pm-projectctl.socket`; check `/srv/pm/projectctl.sock` exists |
-| Runner socket not detected | Check project user's rootless Docker: `systemctl --user status docker -M pm-<name>@` |
+| Play fails on `pm_auth_password` | It is unset. §2.2 |
+| `pm-pm-1` restarting | `docker logs pm-pm-1` as the pm user. A missing native binding means §7.5 regressed |
+| HTTPS 502 | pm container is down; see above |
+| 401 with the right password | Re-run the play to regenerate htpasswd |
+| Cloudflare 521 | `nft list set inet filter cloudflare4` must be non-empty |
+| Project creation fails at preflight | A CREATE_TOOLS binary is missing from the system PATH; §7.3 |
+| Project stuck `awaiting-key` | Deploy key missing or read-only. It needs **write** |
+| Project `disconnected` | `systemctl --machine pm-<name>@.host --user status runner` |
+| Run fails instantly with an image error | `docker image ls pm-agent` in the project's daemon; §7.4 |
+| `pm-projectctl` hangs | `systemctl status pm-projectctl.socket`; `/srv/pm/projectctl.sock` must exist |
 
 ---
 
-## 7. Security notes
+## 11. Security notes
 
-- **No provider credentials in Ansible** — provider API keys are written
-  directly through `pm-projectctl set-credential` from the UI (T36/T41).
-- **pm_auth_password must be vault-encrypted** before committing to the repo.
-- The self-signed origin cert is for the Cloudflare→origin leg only.
-  Cloudflare presents a real cert to the browser.
-- The `pm` group is the only group allowed to connect to the
-  `pm-projectctl.socket`.  Project users (`pm-<name>`) never get this
-  permission.
+- Provider credentials never appear in Ansible, in argv, or in plaintext in the
+  database. They reach the agent as a read-only mount, read inside the
+  container.
+- `pm_auth_password` must be vault-encrypted before committing.
+- The self-signed origin cert covers the Cloudflare→origin leg only.
+- The `pm` group may connect to `pm-projectctl.socket`. Project users
+  (`pm-<name>`) are deliberately never in it.
+- `auth/htpasswd` is world-readable because nginx's worker runs as an unrelated
+  uid under rootless Docker. bcrypt (`-B`) is what makes that acceptable.

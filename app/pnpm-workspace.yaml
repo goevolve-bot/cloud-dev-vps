@@ -4,9 +4,15 @@ packages:
   - runner
   - web
 
-allowBuilds:
-  better-sqlite3: true
-  esbuild: true
+# pnpm 10 refuses to run dependency lifecycle scripts unless the package is
+# named here. `allowBuilds` — which is what this used to say — is not a pnpm
+# setting at all, so it was silently ignored: better-sqlite3's postinstall
+# never ran, no better_sqlite3.node was ever produced, and the pm container
+# crash-looped on "Could not locate the bindings file" from its very first
+# deploy. The list form is the real key.
+onlyBuiltDependencies:
+  - better-sqlite3
+  - esbuild
 
 catalog:
   typescript: ^5.7.3

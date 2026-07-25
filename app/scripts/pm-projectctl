@@ -65,6 +65,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "runner_exec": ["/usr/bin/node", "/srv/pm/app/runner/dist/index.js"],
     # Clone lives at ~/<work_subdir>/<repo>; group-readable by pm for `.pm/`.
     "work_subdir": "work",
+    # The image @pm/runner executes every agent container in, exported by
+    # roles/pm/tasks/agent_image.yml. Each project has its own rootless daemon
+    # with its own image store, so create loads this tar into it; the .id file
+    # beside the tar says which image the tar holds, so a re-create after a
+    # redeploy reloads and an unchanged one does not.
+    "agent_image_tag": "pm-agent:latest",
+    "agent_image_tar": "/srv/pm/images/pm-agent.tar",
+    "agent_image_id_file": "/srv/pm/images/pm-agent.id",
     "subid_count": 65536,
     "subid_min": 100000,
     "git_user_name": "pm",
@@ -86,6 +94,7 @@ CREATE_TOOLS = [
     "git",
     "newuidmap",
     "newgidmap",
+    "docker",
     "dockerd-rootless-setuptool.sh",
 ]
 DELETE_TOOLS = ["userdel"]
@@ -133,6 +142,9 @@ class Config:
         self.user_prefix: str = values["user_prefix"]
         self.runner_exec: List[str] = list(values["runner_exec"])
         self.work_subdir: str = values["work_subdir"]
+        self.agent_image_tag: str = values["agent_image_tag"]
+        self.agent_image_tar: str = values["agent_image_tar"]
+        self.agent_image_id_file: str = values["agent_image_id_file"]
         self.subid_count: int = int(values["subid_count"])
         self.subid_min: int = int(values["subid_min"])
         self.git_user_name: str = values["git_user_name"]
@@ -686,6 +698,62 @@ def ensure_rootless_docker(cfg: Config, pw: "pwd.struct_passwd") -> Dict[str, An
     return {"installed": not installed, "socket": socket_file}
 
 
+def ensure_agent_image(cfg: Config, pw: "pwd.struct_passwd") -> Dict[str, Any]:
+    """Load the exported agent image into this project's rootless daemon.
+
+    @pm/runner runs every agent container as `docker run ... pm-agent`, against
+    the *project's* daemon. Image stores are per-daemon, so a project whose
+    store is empty fails every single run at `docker run` — after the UI has
+    already reported the project as ready. That is the failure this exists to
+    make impossible.
+
+    Loading is skipped when the daemon already holds the exported image, which
+    is the normal case for `create` on an existing project.
+    """
+    tar = cfg.agent_image_tar
+    id_file = cfg.agent_image_id_file
+    tag = cfg.agent_image_tag
+
+    if not os.path.exists(tar):
+        raise PmError(
+            "agent_image_missing",
+            "%s does not exist — run the pm role (roles/pm/tasks/agent_image.yml) "
+            "before creating projects, or no run will ever start" % tar,
+        )
+
+    expected = ""
+    try:
+        with open(id_file, "r", encoding="utf-8") as handle:
+            expected = handle.read().strip()
+    except OSError:
+        # No id file means we cannot tell what the tar holds; load unconditionally.
+        expected = ""
+
+    current = run(
+        ["docker", "image", "inspect", "--format", "{{.Id}}", tag],
+        env=user_env(pw),
+        as_user=pw,
+        check=False,
+    ).stdout.strip()
+
+    if expected and current == expected:
+        return {"tag": tag, "loaded": False, "id": current}
+
+    run(["docker", "load", "--input", tar], env=user_env(pw), as_user=pw, timeout=600)
+    loaded = run(
+        ["docker", "image", "inspect", "--format", "{{.Id}}", tag],
+        env=user_env(pw),
+        as_user=pw,
+        check=False,
+    ).stdout.strip()
+    if not loaded:
+        raise PmError(
+            "agent_image_missing",
+            "loaded %s but the daemon still has no image tagged %s" % (tar, tag),
+        )
+    return {"tag": tag, "loaded": True, "id": loaded}
+
+
 # --------------------------------------------------------------------------
 # create — deploy key
 # --------------------------------------------------------------------------
@@ -1035,6 +1103,12 @@ def verb_create(args: Dict[str, Any], cfg: Config, emit: Emit) -> Dict[str, Any]
                 ),
             }
 
+        # After the clone, not before: the first `create` on a fresh repository
+        # usually returns awaiting-key, and loading a gigabyte of image into a
+        # project that may never get its deploy key added is wasted work.
+        emit("image", "loading the agent image into the project daemon")
+        agent_image = ensure_agent_image(cfg, pw)
+
         emit("scaffold", "checking .pm/ tree")
         scaffold = scaffold_pm_tree(cfg, pw, repo_dir)
 
@@ -1068,6 +1142,7 @@ def verb_create(args: Dict[str, Any], cfg: Config, emit: Emit) -> Dict[str, Any]
             "dockerSocket": docker["socket"],
             "runnerSocket": runner_socket_path(cfg, name),
             "scaffolded": scaffold["scaffolded"],
+            "agentImage": agent_image,
             "subids": subids,
             "warnings": warnings,
         }

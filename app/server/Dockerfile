@@ -15,7 +15,15 @@ COPY web/package.json web/package.json
 
 # This image serves the SPA as well as the API, so the install has to cover
 # @pm/web's build toolchain (vite, react) and not just @pm/server's runtime.
-RUN pnpm install --frozen-lockfile --filter @pm/server... --filter @pm/web...
+#
+# better-sqlite3 publishes prebuilt binaries for glibc only, so on Alpine its
+# postinstall always falls through to node-gyp and needs a compiler. The
+# toolchain is added and removed inside one RUN so it never reaches a layer:
+# split across two RUNs, `apk del` would leave the ~200 MB it was meant to
+# reclaim sitting in the image below it.
+RUN apk add --no-cache --virtual .build-deps python3 make g++ \
+ && pnpm install --frozen-lockfile --filter @pm/server... --filter @pm/web... \
+ && apk del .build-deps
 
 COPY core ./core
 COPY server ./server

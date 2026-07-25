@@ -2,11 +2,15 @@
 # --------------------------------------------------------------------------
 # roles/pm — main entry point
 # Calls sub-task files in dependency order:
-#   base.yml       → T39  pm user, rootless dockerd, dirs, sysctl, stack up
-#   runner.yml     →      system Node + built @pm/runner at pm-projectctl's
-#                         runner_exec path (needs base.yml's app sync)
-#   nginx_tls.yml  → T40  nginx conf, self-signed cert, htpasswd
-#   projectctl.yml → T41  pm-projectctl binary + units
+#   base.yml        → T39  pm user, rootless dockerd, dirs, sysctl, stack up
+#   docker_host.yml →      system-wide docker CLI + rootless extras, without
+#                          which project users have no docker at all
+#   agent_image.yml →      builds and exports pm-agent, the image every run
+#                          executes in (needs base.yml's app sync + pm docker)
+#   runner.yml      →      system Node + built @pm/runner at pm-projectctl's
+#                          runner_exec path (needs base.yml's app sync)
+#   nginx_tls.yml   → T40  nginx conf, self-signed cert, htpasswd
+#   projectctl.yml  → T41  pm-projectctl binary + units
 # T42 (nftables 443 rule) is handled by roles/nftables via the pm_* vars.
 # --------------------------------------------------------------------------
 
@@ -27,6 +31,12 @@
 
 - name: T39 — pm base (user, docker, dirs, sysctl, compose stack)
   include_tasks: base.yml
+
+- name: Install system-wide Docker for project users
+  include_tasks: docker_host.yml
+
+- name: Build and export the agent image
+  include_tasks: agent_image.yml
 
 - name: Build and deploy the per-project runner
   include_tasks: runner.yml

@@ -41,6 +41,16 @@ pm_sysctl_unprivileged_port_start: 443
 pm_node_version: "22.14.0"
 # Must be a pnpm major that reads lockfileVersion 9.0 (app/pnpm-lock.yaml),
 # otherwise the --frozen-lockfile install of @pm/runner cannot verify anything.
+#
+# Keep in sync with `packageManager` in app/package.json. Both are needed and
+# neither is redundant: `corepack prepare --activate` (runner.yml) only sets the
+# *fallback* version, while Corepack's shim always prefers the project's own
+# `packageManager` field — and when that field is absent it resolves whatever is
+# latest on the registry and then writes the field back into package.json. On
+# this host that write happens as the pm user against a root-synced tree, so the
+# runner install died with EACCES on /srv/pm/app/package.json before it ever
+# read the lockfile. The field also pins the pnpm used inside server/Dockerfile,
+# which has the same `corepack enable` with no version of its own.
 pm_pnpm_version: "10.11.0"
 pm_node_arch_map:
   x86_64: x64
@@ -88,3 +98,34 @@ docker_compose_arch_map:
   aarch64: aarch64
   arm64: aarch64
   armv7l: armv7
+
+# System-wide Docker for project users (roles/pm/tasks/docker_host.yml).
+# Installed from the static archives, not Docker's apt repo: the apt package
+# docker-ce-rootless-extras pulls in docker-ce, i.e. a rootful system daemon,
+# which is precisely what this design keeps off the host.
+pm_docker_version: "29.6.2"
+# download.docker.com/linux/static/stable/<arch>/ — kernel arch names.
+pm_docker_arch_map:
+  x86_64: x86_64
+  aarch64: aarch64
+  arm64: aarch64
+  armv7l: armhf
+
+# Compose v2 delegates `build` to buildx; project verify environments are built
+# by the project user, so the plugin has to be system-wide too.
+pm_buildx_version: v0.35.0
+# GitHub release assets use OCI arch names, which match neither of the maps
+# above (x64 for Node, x86_64 for download.docker.com).
+pm_oci_arch_map:
+  x86_64: amd64
+  aarch64: arm64
+  arm64: arm64
+  armv7l: arm-v7
+
+# The agent image (app/agent-image/Dockerfile) that every run executes in.
+# Built once as the pm user at deploy time and exported here; pm-projectctl
+# loads it into each project's own rootless daemon at create time. Building it
+# per project instead would re-download the whole toolchain for every project
+# and move a multi-minute failure into the create-project modal.
+pm_agent_image_tag: "pm-agent:latest"
+pm_agent_image_dir: /srv/pm/images

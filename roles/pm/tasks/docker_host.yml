@@ -1,0 +1,123 @@
+---
+# --------------------------------------------------------------------------
+# roles/pm — system-wide Docker for project users
+#
+# Every other Docker install in this repo is per-user: roles/dev_tools runs
+# get.docker.com/rootless as {{ dev_user }}, base.yml runs it again as
+# {{ pm_user }}, and both drop their binaries in that user's ~/bin. Project
+# users (pm-<name>) are created later, by pm-projectctl, from the UI — there
+# is no play to run for them, and nothing in their PATH.
+#
+# Two things therefore fail without this file:
+#
+#   * `pm-projectctl create` preflights CREATE_TOOLS, which includes
+#     dockerd-rootless-setuptool.sh, and then calls it to install the project's
+#     rootless daemon. Neither that script nor `docker` existed anywhere on
+#     PATH, so project creation could not get past preflight.
+#   * @pm/runner shells out to `docker` and `docker compose` as the project
+#     user for every agent container and every verify environment.
+#
+# Static tarballs rather than Docker's apt repo, deliberately:
+# docker-ce-rootless-extras depends on docker-ce, which would install and
+# enable a *rootful* system daemon — the one thing this design does not want on
+# the box. The static archives contain exactly the client, the daemon binaries
+# the rootless wrapper needs, and the wrapper scripts.
+# --------------------------------------------------------------------------
+
+- name: Install rootless Docker runtime dependencies
+  apt:
+    name:
+      - uidmap            # newuidmap/newgidmap — the setuid half of userns
+      - dbus-user-session
+      - iptables          # rootlesskit programs NAT inside the network namespace
+      - slirp4netns       # userspace networking; without it rootlesskit has no port driver
+      - fuse-overlayfs    # storage driver; the fallback (vfs) copies the whole tree per layer
+      - ca-certificates
+      - xz-utils
+    state: present
+
+- name: Set Docker static distribution facts
+  set_fact:
+    pm_docker_arch: "{{ pm_docker_arch_map.get(ansible_facts['architecture'], ansible_facts['architecture']) }}"
+
+- name: Create Docker static download directory
+  file:
+    path: /opt/docker-static
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# The archive unpacks to docker/{docker,dockerd,containerd,runc,...}; only the
+# client is strictly needed by project users, but dockerd and its shims are
+# what dockerd-rootless.sh execs, so the whole set goes to /usr/local/bin.
+- name: Download and unpack Docker {{ pm_docker_version }} static binaries
+  unarchive:
+    src: "https://download.docker.com/linux/static/stable/{{ pm_docker_arch }}/docker-{{ pm_docker_version }}.tgz"
+    dest: /usr/local/bin
+    remote_src: true
+    extra_opts:
+      - "--strip-components=1"
+    owner: root
+    group: root
+    mode: "0755"
+    creates: /usr/local/bin/dockerd
+
+- name: Download and unpack Docker {{ pm_docker_version }} rootless extras
+  unarchive:
+    src: "https://download.docker.com/linux/static/stable/{{ pm_docker_arch }}/docker-rootless-extras-{{ pm_docker_version }}.tgz"
+    dest: /usr/local/bin
+    remote_src: true
+    extra_opts:
+      - "--strip-components=1"
+    owner: root
+    group: root
+    mode: "0755"
+    creates: /usr/local/bin/dockerd-rootless-setuptool.sh
+
+# CLI plugins go in the system-wide search path so every project user finds
+# them without a per-user ~/.docker/cli-plugins. `docker compose` is what
+# executeVerify drives the project's stack with; buildx is what Compose v2
+# delegates `build` to.
+- name: Create system-wide Docker CLI plugin directory
+  file:
+    path: /usr/local/lib/docker/cli-plugins
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install Docker Compose CLI plugin system-wide
+  get_url:
+    url: "https://github.com/docker/compose/releases/download/{{ docker_compose_version }}/docker-compose-linux-{{ docker_compose_arch_map.get(ansible_facts['architecture'], ansible_facts['architecture']) }}"
+    dest: /usr/local/lib/docker/cli-plugins/docker-compose
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install Docker Buildx CLI plugin system-wide
+  get_url:
+    url: "https://github.com/docker/buildx/releases/download/{{ pm_buildx_version }}/buildx-{{ pm_buildx_version }}.linux-{{ pm_oci_arch_map.get(ansible_facts['architecture'], ansible_facts['architecture']) }}"
+    dest: /usr/local/lib/docker/cli-plugins/docker-buildx
+    owner: root
+    group: root
+    mode: "0755"
+
+# pm-projectctl preflights this exact name before it will create a project;
+# checking here turns a UI-time "project creation failed" into a deploy-time
+# failure with a stack trace pointing at the cause.
+- name: Verify the tools pm-projectctl preflights are on the system PATH
+  # shell, not command: pm-projectctl resolves these with shutil.which() against
+  # BASE_PATH, so what matters is PATH resolution, not a path we hardcode here.
+  shell: "command -v {{ item }}"
+  changed_when: false
+  loop:
+    - docker
+    - dockerd-rootless-setuptool.sh
+    - dockerd-rootless.sh
+    - newuidmap
+    - newgidmap
+
+- name: Verify a non-privileged account can run the docker client and its plugins
+  command: runuser -u nobody -- docker compose version
+  changed_when: false

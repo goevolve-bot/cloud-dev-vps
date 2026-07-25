@@ -20,14 +20,22 @@ Batches are grouped by **file locality**, not by issue number, so each file is
 read once instead of a dozen times. The `§` references point back to sections of
 `docs/pm-implementation-review.md` if you want the original wording.
 
-## Not covered by these batches
+## Not covered by these batches — CLOSED 2026-07-25
 
-Two items need a real VPS and cannot be closed from a laptop:
+Both items needed a real VPS. Both were done on one:
 
-- **Verify against a real sample repo** (review §3.9). B3 fixes the code, but the
-  `compose up --wait` behaviour with one-shot services must be confirmed on-host.
-- **Antigravity flags** (review §6, T38). The adapter assumes `agy` accepts Claude
-  Code's exact flag set. Someone has to run `agy --help` on the VPS.
+- **Verify against a real sample repo** (review §3.9) — **confirmed working**.
+  `compose up --wait` scoped to the long-running services does not block on
+  one-shot `test`/`e2e`. A verify run against a pushed branch cloned from
+  origin, ran both suites, collected artifacts, tore down cleanly, and moved
+  the task to `ready-for-review`.
+- **Antigravity flags** (review §6, T38) — **the assumption was wrong**. `agy`
+  has no `--output-format` and no `--verbose`, `--print` emits plain text rather
+  than stream-json, every advertised model id was invalid, and there is no
+  `ANTIGRAVITY_API_KEY` at all (it authenticates from a JSON OAuth file). All
+  four are fixed against the real CLI.
 
-After B1–B4 land, walk the green path on the host once, then rewrite
-`docs/pm-runbook.md` to describe what actually happened (review §8, "Then honesty").
+Deploying to a bare host surfaced five further blockers that no amount of
+reading could have caught — a crash-looping server, no Docker for project
+users, an agent image nobody built. They are written up in
+`docs/pm-runbook.md` §7, along with §8, "What is still unproven".
