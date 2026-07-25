@@ -1,11 +1,16 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import type Database from "better-sqlite3";
-import { listSpecs, listAdrs, slugify, type TaskRecord } from "@pm/core";
+import { listSpecs, listAdrs, slugify, type DiffResult, type TaskRecord } from "@pm/core";
 
-const execFileAsync = promisify(execFile);
+/**
+ * Just enough of RunnerClient to ask for a diff. pm never runs git for a
+ * project — it has no checkout and the pm image has no git — so the runner
+ * produces it.
+ */
+export interface DiffCapableClient {
+  call(verb: "diff", args: { branch: string; base?: string }): Promise<DiffResult>;
+}
 
 export async function composePrompt(opts: {
   phase: string;
@@ -14,8 +19,9 @@ export async function composePrompt(opts: {
   repoDir: string;
   db: Database.Database;
   projectId: number;
+  runnerClient?: DiffCapableClient;
 }): Promise<string> {
-  const { phase, task, pmDir, repoDir, db, projectId } = opts;
+  const { phase, task, pmDir, db, projectId, runnerClient } = opts;
 
   // 1. Read the phase prompt template
   const templatePath = join(import.meta.dirname, "../prompts", `${phase}.txt`);
@@ -73,16 +79,24 @@ export async function composePrompt(opts: {
   }
   const findings = findingsList.length > 0 ? findingsList.join("\n\n") : "No prior findings.";
 
-  // git diff (only for review)
+  // git diff (only for review) — asked of the runner, which is the only
+  // process with the repo and with git installed.
   let diff = "";
   if (phase === "review") {
-    try {
-      const defaultBranch = (await execFileAsync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: repoDir })).stdout.trim();
-      const branchName = `pm/task-${task.id}-${task.slug}`;
-      const diffOutput = (await execFileAsync("git", ["diff", `${defaultBranch}...${branchName}`], { cwd: repoDir })).stdout;
-      diff = diffOutput.trim() || "No changes.";
-    } catch (err: any) {
-      diff = `Could not generate git diff: ${err.message}`;
+    const branchName = `pm/task-${task.id}-${task.slug}`;
+    if (!runnerClient) {
+      diff = "No changes. (no runner connection was available to produce a diff)";
+    } else {
+      try {
+        const result = await runnerClient.call("diff", { branch: branchName });
+        if (!result.found) {
+          diff = `No changes. (branch ${branchName} does not exist yet)`;
+        } else {
+          diff = result.diff.trim() || "No changes.";
+        }
+      } catch (err: any) {
+        diff = `Could not generate git diff: ${err.message}`;
+      }
     }
   }
 

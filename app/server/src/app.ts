@@ -23,7 +23,7 @@ import {
 } from "@pm/core";
 import { rebuildIndex, reindexTask } from "./indexer/index.js";
 import type { RunnerRegistry } from "./runners/registry.js";
-import { QueueManager, sseEmitter, activeRunnerRunIds } from "./queue.js";
+import { QueueManager, sseEmitter } from "./queue.js";
 import { callProjectctl } from "./projectctl.js";
 
 export interface AppContext {
@@ -735,12 +735,9 @@ export function buildApp(ctx: AppContext): FastifyInstance {
     const client = runners.client(project.name);
     if (!client) return reply.code(409).send({ error: "runner_not_connected" });
 
-    const runnerRunId = activeRunnerRunIds.get(run.id);
-    if (runnerRunId === undefined) {
-      return reply.code(409).send({ error: "run_not_started_on_runner" });
-    }
-
-    const stopResult = await client.call("stopRun", { runId: runnerRunId });
+    // pm's own row id *is* the runner's run id, so a restarted pm can still
+    // stop a run it did not start itself.
+    const stopResult = await client.call("stopRun", { runId: run.id });
     if (stopResult.stopped) {
       db.prepare("UPDATE runs SET status = 'cancelled', finished_at = ? WHERE id = ?").run(new Date().toISOString(), run.id);
     }

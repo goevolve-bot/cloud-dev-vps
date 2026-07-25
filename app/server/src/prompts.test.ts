@@ -142,6 +142,20 @@ test("composePrompt produces correct composed prompt for each phase", async () =
     await execFileAsync("git", ["commit", "-m", "add auth file"], { cwd: repoDir });
     await execFileAsync("git", ["checkout", "main"], { cwd: repoDir });
 
+    // The diff is produced by the runner, which is the only process with the
+    // repo (and with git installed at all) — pm just asks for it.
+    const runnerClient = {
+      call: async (_verb: "diff", args: { branch: string }) => {
+        const base = (
+          await execFileAsync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: repoDir })
+        ).stdout.trim();
+        const diff = (
+          await execFileAsync("git", ["diff", `${base}...${args.branch}`], { cwd: repoDir })
+        ).stdout;
+        return { branch: args.branch, base, diff, found: true };
+      },
+    };
+
     const reviewPrompt = await composePrompt({
       phase: "review",
       task,
@@ -149,10 +163,24 @@ test("composePrompt produces correct composed prompt for each phase", async () =
       repoDir,
       db,
       projectId,
+      runnerClient,
     });
     assert.match(reviewPrompt, /performing the Review phase/);
     assert.match(reviewPrompt, /diff --git/);
     assert.match(reviewPrompt, /console\.log\('auth'\)/);
+
+    // Without a runner there is no diff to be had — and pm must not try to run
+    // git itself to compensate.
+    const reviewPromptNoRunner = await composePrompt({
+      phase: "review",
+      task,
+      pmDir,
+      repoDir,
+      db,
+      projectId,
+    });
+    assert.match(reviewPromptNoRunner, /No changes\./);
+    assert.ok(!reviewPromptNoRunner.includes("diff --git"));
   } finally {
     db.close();
     await rm(repoDir, { recursive: true, force: true });

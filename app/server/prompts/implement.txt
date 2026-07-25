@@ -16,3 +16,10 @@ Here are the relevant specs and ADRs:
 {{specsAndAdrs}}
 
 Your goal is to implement the task in the workspace. You should modify the files to implement the features described in the description and plan.
+
+When you are done, commit your work. The workspace is a git worktree already checked out on this task's branch, so:
+
+1. `git add -A` to stage everything you changed, including new files.
+2. `git commit -m "<a short message describing the change>"`.
+
+Commit before you finish, even if the work is partial — anything you leave uncommitted is invisible to the verification step that runs next. Do not push; pm pushes the branch for you. Do not create, switch, rebase, or merge branches.
